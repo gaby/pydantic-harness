@@ -954,6 +954,44 @@ class TestCodeMode:
                 tools['run_code'],
             )
 
+    async def test_one_unrenderable_value_does_not_break_the_summary(self) -> None:
+        """A value that cannot be rendered degrades to its type name; everything else survives.
+
+        `isinstance` matches subclasses on purpose, so a tool can return a mapping whose `__len__`
+        runs its own code and raises. Losing the whole retry to that would be the failure this
+        summary exists to prevent, arrived at from the other side.
+        """
+
+        class HostileLen(dict[str, int]):
+            """A mapping whose length cannot be taken."""
+
+            def __len__(self) -> int:
+                raise RuntimeError('hostile __len__')
+
+        def hostile() -> dict[str, int]:
+            """Return a mapping that cannot be rendered."""
+            return HostileLen(a=1, b=2)
+
+        wrapper = CodeMode[object](max_tool_calls=2).get_wrapper_toolset(_build_function_toolset(hostile, add))
+        assert isinstance(wrapper, CodeModeToolset)
+        ctx = await build_ctx(None, wrapper)
+        tools = await wrapper.get_tools(ctx)
+
+        with pytest.raises(ModelRetry) as exc_info:
+            await wrapper.call_tool(
+                'run_code',
+                {'code': 'a = await hostile()\nb = await add(a=1, b=2)\nc = await add(a=3, b=4)\nc'},
+                ctx,
+                tools['run_code'],
+            )
+
+        message = exc_info.value.message
+        assert '<HostileLen>' in message
+        # The blast radius is that one value: the other entry and the surrounding text are intact.
+        assert "add({'a': 1, 'b': 2}) returned 3" in message
+        assert '2 nested tool calls started before the limit was reached' in message
+        assert 'Account for all 2 before retrying' in message
+
     async def test_ordinary_runtime_error_does_not_mention_restart(self) -> None:
         """A plain exception keeps the message it always had; the hint is not bolted onto everything."""
         wrapper = CodeMode[object]().get_wrapper_toolset(_build_function_toolset(add))

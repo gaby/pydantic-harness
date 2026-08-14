@@ -146,7 +146,7 @@ def _elided(count: int, shown: int, unit: str) -> str:
     return f' ... ({count} {unit} total)' if count > shown else ''
 
 
-def _preview(value: Any, *, nested: bool = False) -> str:
+def _render(value: Any, *, nested: bool = False) -> str:
     """Render a value for an error message, cutting it before rendering rather than after.
 
     Rendering first and slicing after would copy the whole payload to produce 120 characters: a
@@ -158,6 +158,12 @@ def _preview(value: Any, *, nested: bool = False) -> str:
     bounds the work without recursing to arbitrary depth. Anything else is named by type, since
     calling `repr` on it is the unbounded allocation this exists to avoid -- a `BinaryContent`
     result would otherwise render its entire payload.
+
+    When adding a shape here, the question to ask is not "does this branch copy the value" but
+    "can rendering this branch allocate without bound, or raise". Integers pass the first and
+    fail the second: nothing is traversed, and yet `repr` builds the entire decimal expansion,
+    and above the interpreter's digit limit raises instead of returning. Asking only the first
+    question is what let that through.
     """
     limit = _RETRY_VALUE_PREVIEW_CHARS
     items = _RETRY_PREVIEW_ITEMS
@@ -172,13 +178,13 @@ def _preview(value: Any, *, nested: bool = False) -> str:
     if isinstance(value, (list, tuple)):
         if nested:
             return f'[{len(raw)} items]'
-        rendered = ', '.join(_preview(item, nested=True) for item in raw[:items])
+        rendered = ', '.join(_render(item, nested=True) for item in raw[:items])
         return f'[{rendered}]' + _elided(len(raw), items, 'items')
     if isinstance(value, dict):
         if nested:
             return f'{{{len(raw)} items}}'
         pairs = islice(raw.items(), items)
-        rendered = ', '.join(f'{_preview(k, nested=True)}: {_preview(v, nested=True)}' for k, v in pairs)
+        rendered = ', '.join(f'{_render(k, nested=True)}: {_render(v, nested=True)}' for k, v in pairs)
         return '{' + rendered + '}' + _elided(len(raw), items, 'items')
     if isinstance(value, int) and not isinstance(value, bool):
         # `repr` on a large int is not bounded by its own size: it builds the whole decimal
@@ -189,6 +195,25 @@ def _preview(value: Any, *, nested: bool = False) -> str:
     if value is None or isinstance(value, (bool, float)):
         return repr(value)
     return f'<{type(value).__name__}>'
+
+
+def _preview(value: Any) -> str:
+    """Render one caller-supplied value, naming it rather than raising if that fails.
+
+    `_render` covers the shapes a tool result or argument can take, but `isinstance` matches
+    subclasses deliberately, so a tool can return a `list` or `dict` whose `__len__` or
+    `__getitem__` runs its own code and raises. Losing the retry, and with it the record of the
+    calls that already ran, is the failure this summary exists to prevent, so a value that cannot
+    be rendered is named instead -- the answer already used for objects like `BinaryContent`.
+
+    The guard covers exactly one value. The caller still produces every other entry, and a fault
+    in the summary's own logic still surfaces. It bounds what can raise, not what can take a long
+    time: a `__len__` that runs for a minute still runs for a minute.
+    """
+    try:
+        return _render(value)
+    except Exception:
+        return f'<{type(value).__name__}>'
 
 
 def _describe_started_calls(calls: dict[str, ToolCallPart], returns: dict[str, ToolReturnPart]) -> str:
