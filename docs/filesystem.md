@@ -69,8 +69,10 @@ the run.
 
 - **Containment.** Paths resolve relative to `root_dir`; anything resolving
   outside -- via `..`, an absolute path, or a symlink -- is rejected. Symlinks
-  are resolved with `os.path.realpath` *before* the containment check, closing
-  the TOCTTOU window.
+  are resolved with `os.path.realpath` *before* the containment check, so a
+  symlink pointing outside the root at resolve time is rejected rather than
+  followed. Resolution and the subsequent open are separate lookups, so this
+  does not cover a workspace another process mutates mid-operation.
 - **Binary detection.** `read_file` returns a placeholder instead of dumping
   binary bytes into the model context.
 - **Optimistic concurrency.** `write_file`/`edit_file` accept an

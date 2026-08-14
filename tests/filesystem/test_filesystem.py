@@ -612,14 +612,41 @@ class TestSearchFiles:
         result = await toolset.search_files('needle', include_glob='*.py')
         assert result == 'module.py:1:needle here'
 
-    async def test_search_skips_circular_symlinks(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
-        # `Path.resolve` reports a symlink loop as `RuntimeError` on Python
-        # <= 3.12; the loop entry is skipped instead of aborting the search.
-        (fs_root / 'real.txt').write_text('needle here\n')
+    async def test_search_skips_symlink_cycles(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
+        # A cycle in the tree is skipped, not raised, on every supported Python.
+        # Each entry is resolved before the `is_file` guard, so on 3.10-3.12 the
+        # cycle reaches `resolve` and this exercises the handler for real;
+        # from 3.13 on, non-strict `resolve` returns the cycle path unchanged
+        # and `is_file` filters it instead.
+        (fs_root / 'real.txt').write_text('cycle needle\n')
         (fs_root / 'loop').symlink_to(fs_root / 'loop2')
         (fs_root / 'loop2').symlink_to(fs_root / 'loop')
-        result = await toolset.search_files('needle here')
-        assert result == 'real.txt:1:needle here'
+
+        result = await toolset.search_files('cycle needle')
+
+        assert result == 'real.txt:1:cycle needle'
+
+    async def test_search_skips_entry_whose_resolve_raises(
+        self, toolset: FileSystemToolset[None], fs_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # `resolve` only raises for a cycle on 3.10-3.12, so patch it to fail the
+        # way a cycle would and pin the handler on every version. `RuntimeError`
+        # is the one that matters: `_recoverable` does not convert it, so an
+        # unhandled one aborts the run instead of returning the other matches.
+        (fs_root / 'real.txt').write_text('swap needle\n')
+        (fs_root / 'swapped.txt').write_text('swap needle\n')
+        unpatched = Path.resolve
+
+        def failing_resolve(self: Path, strict: bool = False) -> Path:
+            if self.name == 'swapped.txt':
+                raise RuntimeError(f'Symlink loop from {str(self)!r}')
+            return unpatched(self, strict=strict)
+
+        monkeypatch.setattr(Path, 'resolve', failing_resolve)
+
+        result = await toolset.search_files('swap needle')
+
+        assert result == 'real.txt:1:swap needle'
 
 
 class TestFindFiles:

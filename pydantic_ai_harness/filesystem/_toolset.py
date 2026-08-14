@@ -78,7 +78,8 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
 
     Security model:
     - All paths resolved relative to root with canonical path checks
-    - Symlinks resolved before authorization (prevents TOCTTOU)
+    - Symlinks resolved before authorization, so one pointing outside the root at
+      resolve time is rejected rather than followed
     - Glob-based allow/deny filtering
     - Protected path patterns (e.g. `.git/`, `.env`)
     - Binary file detection blocks text operations
@@ -384,11 +385,14 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
             try:
                 rel_str = str(file_path.relative_to(self._real_root))
                 # Authorize the canonical target so a symlink can't be used to
-                # read a file the agent couldn't open directly. `RuntimeError`
-                # covers `Path.resolve` reporting a symlink loop on Python
-                # <= 3.12; treat it as one more unreadable entry to skip.
+                # read a file the agent couldn't open directly.
                 real_path = self._safe_resolve(rel_str, write=True)
-            except (PermissionError, ValueError, RuntimeError):
+            # One unreadable entry skips rather than ending the walk. A denied or
+            # escaping path arrives as `PermissionError` (an `OSError`); a symlink
+            # cycle as `RuntimeError` on 3.10-3.12 and as `OSError` from 3.13 on,
+            # where pathlib moved onto `os.path.realpath`. `_recoverable` converts
+            # neither, so an unhandled one would abort the run.
+            except (OSError, ValueError, RuntimeError):
                 continue
             if not real_path.is_file():
                 continue
