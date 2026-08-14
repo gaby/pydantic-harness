@@ -399,7 +399,10 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
             if include_glob and not fnmatch.fnmatch(rel_str, include_glob):
                 continue
             try:
-                raw = file_path.read_bytes()
+                resolved_file = file_path.resolve(strict=True)
+                if not resolved_file.is_relative_to(self._real_root):
+                    continue
+                raw = resolved_file.read_bytes()
             except OSError:  # pragma: no cover
                 continue
             if _is_binary(raw):

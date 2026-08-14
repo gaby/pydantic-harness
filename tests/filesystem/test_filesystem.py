@@ -592,6 +592,15 @@ class TestSearchFiles:
         assert 'keep.py' in result
         assert 'skip.md' not in result
 
+    async def test_search_skips_symlinks_outside_root(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
+        outside = fs_root.parent / 'outside.txt'
+        outside.write_text('outside secret\n')
+        (fs_root / 'linked.txt').symlink_to(outside)
+
+        result = await toolset.search_files('outside secret')
+
+        assert result == 'No matches found.'
+
 
 class TestFindFiles:
     async def test_find_glob(self, toolset: FileSystemToolset[None]) -> None:
