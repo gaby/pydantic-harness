@@ -837,9 +837,10 @@ class TestCodeMode:
         execution and trip on another, changing the workflow history. Silence would be worse than
         the cap: the caller configured a limit that is not being applied.
         """
-        import temporalio.workflow
-
-        monkeypatch.setattr(temporalio.workflow, 'in_workflow', lambda: True)
+        # Temporal is an optional extra, so the no-extras matrix job skips these rather than
+        # failing to import it.
+        workflow = pytest.importorskip('temporalio.workflow')
+        monkeypatch.setattr(workflow, 'in_workflow', lambda: True)
 
         wrapper = CodeMode[object](resource_limits={'max_duration_secs': 0.3}).get_wrapper_toolset(
             _build_function_toolset(add)
@@ -863,9 +864,10 @@ class TestCodeMode:
 
     async def test_workflow_duration_report_is_once_per_capability(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """An agent is reused across runs, so entering again must not repeat the report."""
-        import temporalio.workflow
-
-        monkeypatch.setattr(temporalio.workflow, 'in_workflow', lambda: True)
+        # Temporal is an optional extra, so the no-extras matrix job skips these rather than
+        # failing to import it.
+        workflow = pytest.importorskip('temporalio.workflow')
+        monkeypatch.setattr(workflow, 'in_workflow', lambda: True)
 
         wrapper = CodeMode[object]().get_wrapper_toolset(_build_function_toolset(add))
         assert isinstance(wrapper, CodeModeToolset)
@@ -887,9 +889,10 @@ class TestCodeMode:
         invisible, because repeats from one call site are collapsed, which is why the flag is not
         shared across clones. Both counts are pinned so neither can drift from the docs unnoticed.
         """
-        import temporalio.workflow
-
-        monkeypatch.setattr(temporalio.workflow, 'in_workflow', lambda: True)
+        # Temporal is an optional extra, so the no-extras matrix job skips these rather than
+        # failing to import it.
+        workflow = pytest.importorskip('temporalio.workflow')
+        monkeypatch.setattr(workflow, 'in_workflow', lambda: True)
 
         from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
         from pydantic_ai.models.function import AgentInfo, FunctionModel
@@ -922,9 +925,10 @@ class TestCodeMode:
         A snippet allocates the same on replay and the call budget is a function of the snippet,
         so neither moves the decision and dropping them would give up protection for nothing.
         """
-        import temporalio.workflow
-
-        monkeypatch.setattr(temporalio.workflow, 'in_workflow', lambda: True)
+        # Temporal is an optional extra, so the no-extras matrix job skips these rather than
+        # failing to import it.
+        workflow = pytest.importorskip('temporalio.workflow')
+        monkeypatch.setattr(workflow, 'in_workflow', lambda: True)
 
         memory_capped = CodeMode[object](resource_limits={'max_memory': 8 * 1024 * 1024}).get_wrapper_toolset(
             _build_function_toolset(add)
@@ -955,9 +959,10 @@ class TestCodeMode:
 
     async def test_unlimited_in_workflow_code_warns_about_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """With no duration limit configured there is no divergence to report."""
-        import temporalio.workflow
-
-        monkeypatch.setattr(temporalio.workflow, 'in_workflow', lambda: True)
+        # Temporal is an optional extra, so the no-extras matrix job skips these rather than
+        # failing to import it.
+        workflow = pytest.importorskip('temporalio.workflow')
+        monkeypatch.setattr(workflow, 'in_workflow', lambda: True)
 
         wrapper = CodeMode[object](resource_limits='unlimited').get_wrapper_toolset(_build_function_toolset(add))
         assert isinstance(wrapper, CodeModeToolset)
