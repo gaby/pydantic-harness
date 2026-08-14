@@ -119,9 +119,8 @@ process: the subprocess starts with exactly the resolved environment (your
 a security boundary. A command running under the same OS identity may still
 read the parent process's environment through system interfaces such as Linux
 procfs, as well as other host files. Use OS-level isolation when commands are
-untrusted. The flip side is that a
-pattern broad enough to strip `PATH` or `HOME`, or an `env` that omits them, can
-break command resolution. External commands may still run via the shell's
+untrusted. The flip side is that a pattern broad enough to strip `PATH` or
+`HOME`, or an `env` that omits them, can break command resolution. External commands may still run via the shell's
 built-in default `PATH` on some systems, but don't rely on it -- set `PATH`
 explicitly when you replace the environment.
 
