@@ -188,8 +188,7 @@ Printed output is limited to 10 MiB. Exceeding the limit makes `run_code` return
 Sandbox execution is bounded by `resource_limits`, which defaults to 30 seconds of execution time
 and a 256 MiB heap. Outside Temporal workflow code, `max_duration_secs` gives a per-snippet
 ceiling: no single `run_code` snippet runs longer than that much sandbox time, which is what stops
-a runaway loop. Time spent awaiting a
-nested tool is excluded from that timer.
+a runaway loop. Time spent awaiting a nested tool is excluded from that timer.
 
 That ceiling is not enforced in Temporal workflow code, and nowhere else. `run_code` runs
 workflow-side under `TemporalDurability` and its snippets are re-executed during replay, so an
