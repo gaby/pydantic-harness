@@ -34,7 +34,7 @@ agent = Agent(
     'openai:gpt-5',
     capabilities=[
         StepPersistence(store=store),
-        ConversationSearch(SnapshotHistorySource(store)),
+        ConversationSearch(SnapshotHistorySource(store), scope='conversation'),
         SlidingWindowCompaction(max_messages=40),
     ],
 )
@@ -60,14 +60,14 @@ Overlap matching keys off a content hash of each serialized message, not object 
 
 ## Scope
 
-By default, `scope='conversation'` restricts the corpus to runs whose `conversation_id` matches the calling run. Pass an authenticated, tenant-scoped value as `conversation_id` when running the agent:
+`scope='conversation'` restricts the corpus to runs whose `conversation_id` matches the calling run. Pass an authenticated, tenant-scoped value as `conversation_id` when running the agent:
 
 ```python
 agent = Agent(
     'openai:gpt-5',
     capabilities=[
         StepPersistence(store=store),
-        ConversationSearch(SnapshotHistorySource(store)),
+        ConversationSearch(SnapshotHistorySource(store), scope='conversation'),
     ],
 )
 
@@ -87,12 +87,31 @@ A `RunContext` whose `conversation_id` is unset searches nothing under this scop
 
 Scoping is applied to the `RunRecord`s a `HistorySource` returns, so a custom source must populate `conversation_id` on them for the default scope to match anything. Set `scope='all'` only when the store is already isolated to one principal. This opt-in mode searches every run the source enumerates and can return verbatim excerpts from any of them.
 
+### Migrating from the `scope='all'` default
+
+This default changed. Earlier releases defaulted to `scope='all'`, so one search ranked every run in the store; it now defaults to `conversation`. Nothing raises on upgrade -- a caller who relied on the old default keeps working and simply stops seeing other conversations -- so leaving `scope` unset emits a `HarnessDeprecationWarning` once per capability instance naming the change.
+
+Set the option explicitly to resolve it. Both values are supported and neither is deprecated:
+
+- `scope='all'` restores the previous store-wide behavior. Correct when the store holds a single principal's history.
+- `scope='conversation'` keeps the new behavior and silences the warning.
+
+Silence every harness deprecation at once, if you would rather migrate later:
+
+```python
+import warnings
+
+from pydantic_ai_harness import HarnessDeprecationWarning
+
+warnings.filterwarnings('ignore', category=HarnessDeprecationWarning)
+```
+
 ## Key options
 
 | Option | Default | Purpose |
 | --- | --- | --- |
 | `source` | (required) | Where the corpus comes from. Use `SnapshotHistorySource(store)` over the store `StepPersistence` writes to. |
-| `scope` | `'conversation'` | Restricts search to the calling run's `conversation_id`. Use `'all'` only for a store isolated to one principal. See Scope. |
+| `scope` | `'conversation'` (unset warns) | Restricts search to the calling run's `conversation_id`. Use `'all'` only for a store isolated to one principal. Leaving it unset warns once; see Scope. |
 | `max_matches` | `10` | Maximum matching excerpts the search tool returns. |
 | `context_lines` | `5` | Lines shown around each match (within the match's run). |
 | `bm25_k1` | `1.5` | BM25 term-frequency saturation. This capability's default; Lucene's `BM25Similarity` uses `1.2`. |

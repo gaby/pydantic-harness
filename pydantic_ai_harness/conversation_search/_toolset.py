@@ -36,6 +36,7 @@ from pydantic_ai.tools import AgentDepsT
 from pydantic_ai.toolsets import FunctionToolset
 from typing_extensions import assert_never
 
+from pydantic_ai_harness._warn import warn_default_changed
 from pydantic_ai_harness.conversation_search._source import SUMMARY_PREFIX, HistorySource
 
 SEARCH_HISTORY_DESCRIPTION = """\
@@ -74,6 +75,12 @@ run's. `all` searches every run the source enumerates and must only be used when
 is already isolated to one principal; otherwise, a run can retrieve verbatim excerpts
 from other conversations in the store.
 """
+
+SCOPE_DEFAULT_CHANGE_IMPACT = (
+    "Searches are now limited to the calling run's conversation instead of every run in the store, "
+    'so a caller relying on the old default silently stops seeing other conversations rather than erroring.'
+)
+"""Why the `scope` default change matters, for the deprecation warning both public entry points emit."""
 
 _TOKENIZE_RE = re.compile(r'\w+')
 """Tokenizer regex: word runs (unicode letters, digits, underscore)."""
@@ -296,8 +303,22 @@ class ConversationSearchToolset(FunctionToolset[AgentDepsT]):
         context_lines: int,
         bm25_k1: float,
         bm25_b: float,
-        scope: SearchScope = 'conversation',
+        scope: SearchScope | None = None,
     ) -> None:
+        # `None` means the caller did not choose. It resolves to `conversation` and warns once
+        # here, for the same reason `ConversationSearch` does: this default was `all`, and the
+        # change is invisible to a store-wide caller who keeps working with a narrower corpus.
+        # `ConversationSearch` always passes a resolved scope, so it never double-warns.
+        if scope is None:
+            warn_default_changed(
+                owner='ConversationSearchToolset',
+                option='scope',
+                old='all',
+                new='conversation',
+                impact=SCOPE_DEFAULT_CHANGE_IMPACT,
+                stacklevel=3,
+            )
+            scope = 'conversation'
         super().__init__(id=tool_id)
         if max_matches < 0:
             raise ValueError(f'max_matches must be non-negative, got {max_matches!r}.')
