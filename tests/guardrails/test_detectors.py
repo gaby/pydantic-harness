@@ -529,6 +529,53 @@ class TestForToolResultText:
             )
         )
 
+    def test_a_secret_split_across_adjacent_parts_is_redacted(self):
+        """A model reads adjacent text parts as one span, so neither half matches on its own."""
+        image = BinaryContent(data=b'image', media_type='image/png')
+        result = ToolReturn('safe summary', content=[f'key: {_OPENAI_KEY[:20]}', _OPENAI_KEY[20:], image])
+
+        verdict = for_tool_result_text(redact_secrets)(self._info(result))
+
+        assert verdict == GuardrailResult.replace(
+            ToolReturn('safe summary', content=['key: [redacted:openai_key]', image])
+        )
+
+    def test_a_split_secret_keeps_the_metadata_of_the_part_it_merges_into(self):
+        result = ToolReturn(
+            'safe summary',
+            content=[
+                TextContent(content=f'key: {_OPENAI_KEY[:20]}', metadata={'source': 'vault'}),
+                TextContent(content=_OPENAI_KEY[20:]),
+            ],
+        )
+
+        verdict = for_tool_result_text(redact_secrets)(self._info(result))
+
+        assert verdict == GuardrailResult.replace(
+            ToolReturn(
+                'safe summary',
+                content=[TextContent(content='key: [redacted:openai_key]', metadata={'source': 'vault'})],
+            )
+        )
+
+    def test_a_blocked_term_split_across_adjacent_parts_is_blocked(self):
+        verdict = for_tool_result_text(blocked_keywords(['blocked']))(
+            self._info(ToolReturn('safe summary', content=['blo', 'cked context']))
+        )
+
+        assert verdict.action == 'block'
+
+    def test_content_that_starts_with_a_non_text_part_is_scanned(self):
+        """The text run opens after the image rather than at index 0."""
+        image = BinaryContent(data=b'image', media_type='image/png')
+        result = ToolReturn('safe summary', content=[image, f'key: {_OPENAI_KEY}'])
+
+        verdict = for_tool_result_text(redact_secrets)(self._info(result))
+
+        assert verdict == GuardrailResult.replace(
+            ToolReturn('safe summary', content=[image, 'key: [redacted:openai_key]'])
+        )
+
     def test_unmodified_multipart_content_is_allowed(self):
         result = ToolReturn('no secret', content=['safe context', TextContent(content='more context')])
 

@@ -155,10 +155,14 @@ ToolGuardrail(result_guard=for_tool_result_text(redact_secrets))
 ```
 
 The adapter checks a string `return_value` and all text in `content`, which core
-sends as a separate user-prompt part. When it redacts either channel, it
-preserves the `ToolReturn` metadata, kind, and non-text content. As with
-`for_text`, a non-text result raises by default; pass `on_other='allow'` to skip
-one deliberately.
+sends as a separate user-prompt part. Adjacent text parts are scanned both on
+their own and joined together, so a secret split across two of them is still
+caught. A redaction inside one part leaves the other parts and their metadata
+alone; only a match that straddles a boundary merges that stretch of text into a
+single part, since no smaller part can carry the replacement. When it redacts
+either channel, it preserves the `ToolReturn` metadata, kind, and non-text
+content. As with `for_text`, a non-text result raises by default; pass
+`on_other='allow'` to skip one deliberately.
 
 A detector on the input side needs a text prompt. A multimodal prompt reaches
 the guard rendered as text, so a detector that matches one returns `replace`,

@@ -79,6 +79,49 @@ def _detect_content_text(detector: TextDetector, text: str) -> tuple[GuardrailRe
     return None, replacement
 
 
+def _text_of(part: str | TextContent) -> str:
+    """The model-visible text of one `ToolReturn.content` part."""
+    return part if isinstance(part, str) else part.content
+
+
+def _rewrite_text_part(part: str | TextContent, text: str) -> str | TextContent:
+    """Put `text` back in `part`, keeping the part's shape and any `TextContent.metadata`."""
+    return text if isinstance(part, str) else replace(part, content=text)
+
+
+def _detect_text_run(
+    detector: TextDetector, run: Sequence[str | TextContent]
+) -> tuple[GuardrailResult | None, Sequence[UserContent], bool]:
+    """Run `detector` over one stretch of adjacent text parts, per part and then over the whole stretch.
+
+    The model reads adjacent text parts as one span, so a secret split across two of
+    them matches nothing in either part on its own. The joined pass catches that. It
+    runs over the per-part rewrites rather than the originals, so a secret that sits
+    inside one part is redacted in place and the parts keep their own boundaries and
+    metadata. Only a match that survives per-part redaction -- one that straddles a
+    boundary -- collapses the stretch into a single part, which is the shortest text
+    that can carry the redaction.
+
+    Returns a terminal verdict, the parts to keep, and whether any text changed.
+    """
+    if not run:
+        return None, run, False
+    texts: list[str] = []
+    replaced = False
+    for part in run:
+        verdict, replacement = _detect_content_text(detector, _text_of(part))
+        if verdict is not None:
+            return verdict, run, False
+        replaced |= replacement is not None
+        texts.append(_text_of(part) if replacement is None else replacement)
+    verdict, joined = _detect_content_text(detector, ''.join(texts))
+    if verdict is not None:
+        return verdict, run, False
+    if joined is not None:
+        return None, [_rewrite_text_part(run[0], joined)], True
+    return None, [_rewrite_text_part(part, text) for part, text in zip(run, texts, strict=True)], replaced
+
+
 def _detect_tool_return_content(
     detector: TextDetector, content: str | Sequence[UserContent] | None
 ) -> tuple[GuardrailResult | None, str | Sequence[UserContent] | None]:
@@ -92,18 +135,21 @@ def _detect_tool_return_content(
     if content is None:
         return None, None
     rewritten: list[UserContent] = []
+    run: list[str | TextContent] = []
     replaced = False
-    for part in content:
-        text = part if isinstance(part, str) else part.content if isinstance(part, TextContent) else None
-        if text is None:
-            rewritten.append(part)
+    # The trailing `None` flushes the last run without repeating the flush after the loop.
+    for part in [*content, None]:
+        if isinstance(part, str | TextContent):
+            run.append(part)
             continue
-        verdict, replacement = _detect_content_text(detector, text)
+        verdict, parts, run_replaced = _detect_text_run(detector, run)
         if verdict is not None:
             return verdict, None
-        replaced |= replacement is not None
-        text = text if replacement is None else replacement
-        rewritten.append(text if isinstance(part, str) else replace(part, content=text))
+        rewritten.extend(parts)
+        replaced |= run_replaced
+        run = []
+        if part is not None:
+            rewritten.append(part)
     return None, rewritten if replaced else None
 
 
@@ -456,8 +502,10 @@ def for_tool_result_text(
 
     Plain string results are passed to `detector`. For a `ToolReturn` with a
     string `return_value`, the detector also checks the text in its
-    model-directed `content`. The `ToolReturn` is rebuilt when either channel is
-    redacted, retaining its `metadata`, `kind`, and non-text content.
+    model-directed `content`, both part by part and over each stretch of
+    adjacent text parts joined, so a secret split across two of them is caught.
+    The `ToolReturn` is rebuilt when either channel is redacted, retaining its
+    `metadata`, `kind`, and non-text content.
 
     A non-text result has no safe text replacement. The default raises with the
     adapter name; `on_other='allow'` deliberately skips it.
