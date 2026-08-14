@@ -16,6 +16,7 @@ from pydantic_ai.messages import (
     ToolCallPart,
     ToolReturn,
     ToolReturnPart,
+    UserContent,
     UserPromptPart,
 )
 from pydantic_ai.models.function import AgentInfo, FunctionModel
@@ -528,6 +529,40 @@ class TestForToolResultText:
                 ],
             )
         )
+
+    @pytest.mark.parametrize(
+        'content',
+        ['safe context', ['safe context'], ['safe context', BinaryContent(data=b'image', media_type='image/png')]],
+        ids=['string', 'one_part', 'one_part_beside_binary'],
+    )
+    def test_one_stretch_of_text_reaches_the_detector_once(self, content: str | list[UserContent]):
+        """A stretch of one part has no boundary to straddle, so a joined pass would only repeat it.
+
+        `TextDetector` is a public extension point, so a stateful or per-call-billed detector
+        would otherwise see these three equivalent shapes differently.
+        """
+        seen: list[str] = []
+
+        def record(text: str) -> GuardrailResult:
+            seen.append(text)
+            return GuardrailResult.allow()
+
+        for_tool_result_text(record)(self._info(ToolReturn('safe summary', content=content)))
+
+        assert seen == ['safe summary', 'safe context']
+
+    def test_adjacent_text_parts_add_a_single_joined_call(self):
+        """The joined pass runs once per stretch, over the per-part rewrites."""
+        seen: list[str] = []
+
+        def record(text: str) -> GuardrailResult:
+            seen.append(text)
+            return GuardrailResult.allow()
+
+        image = BinaryContent(data=b'image', media_type='image/png')
+        for_tool_result_text(record)(self._info(ToolReturn('safe summary', content=['a', 'b', image, 'c'])))
+
+        assert seen == ['safe summary', 'a', 'b', 'ab', 'c']
 
     def test_a_secret_split_across_adjacent_parts_is_redacted(self):
         """A model reads adjacent text parts as one span, so neither half matches on its own."""

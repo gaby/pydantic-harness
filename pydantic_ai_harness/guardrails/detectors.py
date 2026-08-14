@@ -102,10 +102,13 @@ def _detect_text_run(
     boundary -- collapses the stretch into a single part, which is the shortest text
     that can carry the redaction.
 
+    A stretch of one part is scanned once. It has no boundary for a value to straddle, so
+    the joined pass would hand `detector` the string it just saw. That matters beyond the
+    wasted call: `TextDetector` is a public extension point, so a detector that is stateful
+    or bills per call would otherwise see `content='x'` and `content=['x']` differently.
+
     Returns a terminal verdict, the parts to keep, and whether any text changed.
     """
-    if not run:
-        return None, run, False
     texts: list[str] = []
     replaced = False
     for part in run:
@@ -114,11 +117,12 @@ def _detect_text_run(
             return verdict, run, False
         replaced |= replacement is not None
         texts.append(_text_of(part) if replacement is None else replacement)
-    verdict, joined = _detect_content_text(detector, ''.join(texts))
-    if verdict is not None:
-        return verdict, run, False
-    if joined is not None:
-        return None, [_rewrite_text_part(run[0], joined)], True
+    if len(run) > 1:
+        verdict, joined = _detect_content_text(detector, ''.join(texts))
+        if verdict is not None:
+            return verdict, run, False
+        if joined is not None:
+            return None, [_rewrite_text_part(run[0], joined)], True
     return None, [_rewrite_text_part(part, text) for part, text in zip(run, texts, strict=True)], replaced
 
 
