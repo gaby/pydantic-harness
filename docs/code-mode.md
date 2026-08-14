@@ -169,6 +169,12 @@ Reserve `print()` for supplementary logging: printed text is surfaced separately
 
 Printed output is limited to 10 MiB. Exceeding the limit makes `run_code` return a model retry.
 
+Each `run_code` call is also limited to 30 seconds of sandbox execution, 256 MiB of sandbox memory,
+and 100 nested tool calls. Time spent awaiting a nested tool is excluded from the sandbox execution
+timer. Override the sandbox limits with `resource_limits={'max_duration_secs': 10, 'max_memory':
+134_217_728}` and the nested-call budget with `max_tool_calls=25`. Pass
+`resource_limits='unlimited'` only when another execution boundary supplies equivalent limits.
+
 ## REPL state
 
 State persists between `run_code` calls within the same agent run -- variables, imports, and function definitions carry over. Pass `restart: true` in the tool call to reset state. If a worker crash or host-side execution failure invalidates the session, `run_code` returns a model retry that reports the reset; the next snippet must recreate any required state.

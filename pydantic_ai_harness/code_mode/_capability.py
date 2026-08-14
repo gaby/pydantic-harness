@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import KW_ONLY, dataclass, field, replace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import TypeAdapter, ValidationError
 from pydantic_ai import AbstractToolset
@@ -14,7 +14,7 @@ from pydantic_ai.messages import ModelResponse, NativeToolSearchReturnPart, Syst
 from pydantic_ai.tools import AgentDepsT, RunContext, ToolDefinition, ToolSelector
 from typing_extensions import TypedDict
 
-from pydantic_ai_harness.code_mode._toolset import CodeModeMount, CodeModeOS, CodeModeToolset
+from pydantic_ai_harness.code_mode._toolset import CodeModeMount, CodeModeOS, CodeModeResourceLimits, CodeModeToolset
 
 if TYPE_CHECKING:
     from pydantic_ai.capabilities.abstract import ValidatedToolArgs
@@ -85,6 +85,9 @@ class CodeMode(AbstractCapability[AgentDepsT]):
     max_retries: int = 3
     """Maximum number of retries for the `run_code` tool (syntax errors count as retries)."""
 
+    max_tool_calls: int = 100
+    """Maximum nested tool calls dispatched by one `run_code` invocation."""
+
     _: KW_ONLY
 
     os_access: CodeModeOS | None = None
@@ -92,6 +95,9 @@ class CodeMode(AbstractCapability[AgentDepsT]):
 
     mount: CodeModeMount | None = None
     """Host directories to expose to sandboxed `pathlib` code; each mount's `mode` controls whether writes reach the host."""
+
+    resource_limits: CodeModeResourceLimits | Literal['unlimited'] | None = None
+    """Sandbox execution limits. `None` applies a 30-second and 256 MiB backstop."""
 
     dynamic_catalog: bool = False
     """Keep the `run_code` tool definition cache-stable as the sandboxed toolset grows.
@@ -141,6 +147,8 @@ class CodeMode(AbstractCapability[AgentDepsT]):
             wrapped=toolset,
             tool_selector=self.tools,
             max_retries=self.max_retries,
+            max_tool_calls=self.max_tool_calls,
+            resource_limits=self.resource_limits,
             dynamic_catalog=self.dynamic_catalog,
             os_access=self.os_access,
             mount=self.mount,

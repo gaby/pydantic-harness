@@ -23,7 +23,7 @@ from pydantic_ai import (
     Tool,
     ToolDefinition,
 )
-from pydantic_ai.exceptions import ModelRetry
+from pydantic_ai.exceptions import ModelRetry, UserError
 from pydantic_ai.messages import ToolCallPart
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.tool_manager import ParallelExecutionMode, ToolManager
@@ -499,6 +499,32 @@ class TestCodeMode:
             )
         result = await wrapper.call_tool('run_code', {'code': 'x + 1'}, ctx, tools['run_code'])
         assert result.return_value == 8
+
+    async def test_run_code_caps_nested_tool_calls(self) -> None:
+        wrapper = CodeMode[object](max_tool_calls=2).get_wrapper_toolset(_build_function_toolset(add))
+        assert isinstance(wrapper, CodeModeToolset)
+        ctx = await build_ctx(None, wrapper)
+        tools = await wrapper.get_tools(ctx)
+
+        with pytest.raises(ModelRetry, match=r'nested tool-call limit exceeded \(2\)'):
+            await wrapper.call_tool(
+                'run_code',
+                {'code': 'import asyncio\nawait asyncio.gather(add(a=1, b=1), add(a=2, b=2), add(a=3, b=3))'},
+                ctx,
+                tools['run_code'],
+            )
+
+    async def test_resource_limit_configuration_is_validated_on_enter(self) -> None:
+        invalid = CodeModeToolset[object](
+            wrapped=_build_function_toolset(add),
+            resource_limits={'unknown': 1},  # pyright: ignore[reportArgumentType]
+        )
+        with pytest.raises(UserError, match='Unknown `resource_limits` key'):
+            await invalid.__aenter__()
+
+        zero_calls = CodeModeToolset[object](wrapped=_build_function_toolset(add), max_tool_calls=0)
+        with pytest.raises(UserError, match='`max_tool_calls` must be at least 1'):
+            await zero_calls.__aenter__()
 
     async def test_run_code_syntax_error_becomes_model_retry(self) -> None:
         """A Python syntax error is surfaced as `ModelRetry` so the model can fix it."""

@@ -9,7 +9,7 @@ import warnings
 from collections.abc import Callable, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from pydantic import Field, TypeAdapter
 from pydantic_ai import AbstractToolset, RunContext, ToolDefinition, WrapperToolset
@@ -26,6 +26,7 @@ from pydantic_ai.messages import (
 from pydantic_ai.tool_manager import ParallelExecutionMode, ToolManager
 from pydantic_ai.tools import AgentDepsT, ToolDenied, ToolSelector, matches_tool_selector
 from pydantic_ai.toolsets.abstract import SchemaValidatorProt, ToolsetTool
+from typing_extensions import NotRequired, Self, TypedDict
 
 try:
     from pydantic_ai.toolsets._tool_search import _SEARCH_TOOLS_NAME  # pyright: ignore[reportPrivateUsage]
@@ -43,13 +44,12 @@ try:
         MontyTypingError,
         MountDir,
         OsFunction,
+        ResourceLimits,
     )
 except ImportError as _import_error:  # pragma: no cover
     raise ImportError(
         'pydantic-monty is required for CodeMode. Install it with: pip install "pydantic-ai-harness[code-mode]"'
     ) from _import_error
-from typing_extensions import NotRequired, Self, TypedDict
-
 from pydantic_ai_harness._monty_exec import MontyExecutor, PrintCapture, is_sandbox_panic
 
 # A raw OS callback. Return `pydantic_monty.NOT_HANDLED` to defer the call to the
@@ -59,6 +59,29 @@ CodeModeOSCallback = Callable[[OsFunction, tuple[object, ...], dict[str, object]
 CodeModeOS = AbstractOS | CodeModeOSCallback
 # Accepted by `CodeMode.mount`: one or more host-directory mounts.
 CodeModeMount = MountDir | list[MountDir]
+
+
+class CodeModeResourceLimits(TypedDict, total=False):
+    """Caps on the sandbox code executed by `run_code`."""
+
+    max_duration_secs: float
+    max_memory: int
+
+
+def _resolve_resource_limits(limits: CodeModeResourceLimits | Literal['unlimited'] | None) -> ResourceLimits:
+    """Merge caller overrides onto the `run_code` backstop."""
+    defaults: ResourceLimits = {'max_duration_secs': 30, 'max_memory': 256 * 1024 * 1024}
+    if limits is None:
+        return defaults
+    if limits == 'unlimited':
+        return {}
+    unknown = set(limits) - set(CodeModeResourceLimits.__annotations__)
+    if unknown:
+        raise UserError(
+            f'Unknown `resource_limits` key(s): {sorted(unknown)}. '
+            f'Valid keys are {sorted(CodeModeResourceLimits.__annotations__)}.'
+        )
+    return {**defaults, **limits}
 
 
 @dataclass
@@ -71,13 +94,13 @@ class _MontyRunState:
     _pool_stack: ExitStack = field(default_factory=ExitStack, repr=False)
     _session_stack: ExitStack = field(default_factory=ExitStack, repr=False)
 
-    def get_session(self, *, type_check: bool, type_check_stubs: str | None) -> MontySession:
+    def get_session(self, *, type_check: bool, type_check_stubs: str | None, limits: ResourceLimits) -> MontySession:
         """Return the run's live REPL session, creating its pool on first use."""
         if self.pool is None:
             self.pool = self._pool_stack.enter_context(Monty())
         if self.session is None:
             self.session = self._session_stack.enter_context(
-                self.pool.checkout(type_check=type_check, type_check_stubs=type_check_stubs)
+                self.pool.checkout(limits=limits, type_check=type_check, type_check_stubs=type_check_stubs)
             )
         return self.session
 
@@ -327,6 +350,12 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
     max_retries: int = 3
     """Maximum number of retries for the `run_code` tool (syntax errors count as retries)."""
 
+    max_tool_calls: int = 100
+    """Maximum nested tool calls dispatched by one `run_code` invocation."""
+
+    resource_limits: CodeModeResourceLimits | Literal['unlimited'] | None = None
+    """Sandbox execution limits. `None` applies a 30-second and 256 MiB backstop."""
+
     os_access: CodeModeOS | None = None
     """Give sandboxed code environment variables, the clock, and file I/O through a handler you provide; unset, they are unavailable."""
 
@@ -374,6 +403,9 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
 
     async def __aenter__(self) -> Self:
         """Enter the wrapped toolset and prepare lazy Monty resources for this run."""
+        _resolve_resource_limits(self.resource_limits)
+        if self.max_tool_calls < 1:
+            raise UserError('`max_tool_calls` must be at least 1')
         run_state = _MontyRunState()
         await self.wrapped.__aenter__()
         self._run_state = run_state
@@ -555,6 +587,8 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
             nonlocal call_counter
             original_name = sanitized_to_original.get(sandbox_name, sandbox_name)
             call_counter += 1
+            if call_counter > self.max_tool_calls:
+                raise RuntimeError(f'Code mode nested tool-call limit exceeded ({self.max_tool_calls})')
             parent_id = ctx.tool_call_id or 'pyd_ai_code_mode'
             tool_call_id = f'{parent_id}__{call_counter}'
             call_part = ToolCallPart(tool_name=original_name, args=kwargs, tool_call_id=tool_call_id)
@@ -612,7 +646,11 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
         capture = PrintCapture()
 
         try:
-            session = run_state.get_session(type_check=type_check, type_check_stubs=type_check_stubs)
+            session = run_state.get_session(
+                type_check=type_check,
+                type_check_stubs=type_check_stubs,
+                limits=_resolve_resource_limits(self.resource_limits),
+            )
             try:
                 monty_state = session.feed_start(
                     code,
