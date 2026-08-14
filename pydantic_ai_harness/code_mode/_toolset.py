@@ -6,7 +6,7 @@ import inspect
 import keyword
 import re
 import warnings
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Coroutine, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
 from typing import Annotated, Any, Literal
@@ -61,8 +61,16 @@ CodeModeOS = AbstractOS | CodeModeOSCallback
 CodeModeMount = MountDir | list[MountDir]
 
 
+class _ToolCallBudgetExceeded(Exception):
+    """A `run_code` snippet asked for more nested tool calls than its budget allows."""
+
+
 class CodeModeResourceLimits(TypedDict, total=False):
-    """Caps on the sandbox code executed by `run_code`."""
+    """Caps on the sandbox code executed by `run_code`.
+
+    Monty enforces these per session. `CodeMode` checks out one session per agent run, so the
+    duration budget is spent across that run rather than restarting at each `run_code` call.
+    """
 
     max_duration_secs: float
     max_memory: int
@@ -351,10 +359,18 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
     """Maximum number of retries for the `run_code` tool (syntax errors count as retries)."""
 
     max_tool_calls: int = 100
-    """Maximum nested tool calls dispatched by one `run_code` invocation."""
+    """Maximum nested tool calls dispatched by one `run_code` invocation.
+
+    Budget is reserved before each call is scheduled, so a snippet cannot allocate host tasks
+    beyond this many. Exceeding it ends that `run_code` call with a model retry.
+    """
 
     resource_limits: CodeModeResourceLimits | Literal['unlimited'] | None = None
-    """Sandbox execution limits. `None` applies a 30-second and 256 MiB backstop."""
+    """Sandbox execution limits, applied to the Monty session shared by the whole agent run.
+
+    `None` applies a 30-second execution and 256 MiB heap backstop; the duration budget is spent
+    across the run rather than restarting at each `run_code` call. `'unlimited'` removes both.
+    """
 
     os_access: CodeModeOS | None = None
     """Give sandboxed code environment variables, the clock, and file I/O through a handler you provide; unset, they are unavailable."""
@@ -403,6 +419,8 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
 
     async def __aenter__(self) -> Self:
         """Enter the wrapped toolset and prepare lazy Monty resources for this run."""
+        # Reject misconfiguration when the run starts rather than at the first `run_code` call,
+        # which may be many model steps later. The resolved value is recomputed at checkout.
         _resolve_resource_limits(self.resource_limits)
         if self.max_tool_calls < 1:
             raise UserError('`max_tool_calls` must be at least 1')
@@ -576,21 +594,31 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
         nested_returns: dict[str, ToolReturnPart] = {}
         call_counter = 0
 
-        async def dispatch_tool_call(sandbox_name: str, kwargs: dict[str, Any]) -> Any:
-            """Dispatch a single tool call from inside the sandbox.
+        def dispatch_tool_call(sandbox_name: str, kwargs: dict[str, Any]) -> Coroutine[Any, Any, Any]:
+            """Reserve nested-call budget, then build the coroutine that runs the call.
+
+            The reservation is synchronous because the executor turns each deferred call into an
+            `asyncio.Task` as soon as this returns, without yielding to the event loop in between.
+            Counting inside the coroutine would let one `asyncio.gather` over many calls allocate a
+            host task per call before the first check ran, which is the cost the budget bounds.
+            Exceeding it raises here, so no further task is created.
+            """
+            nonlocal call_counter
+            if call_counter >= self.max_tool_calls:
+                raise _ToolCallBudgetExceeded
+            call_counter += 1
+            parent_id = ctx.tool_call_id or 'pyd_ai_code_mode'
+            original_name = sanitized_to_original.get(sandbox_name, sandbox_name)
+            return run_tool_call(original_name, f'{parent_id}__{call_counter}', kwargs)
+
+        async def run_tool_call(original_name: str, tool_call_id: str, kwargs: dict[str, Any]) -> Any:
+            """Run a single tool call dispatched from inside the sandbox.
 
             Returns the serialized tool result on success. On failure, the
             exception propagates -- the execution loop passes it back into
             Monty via `ExternalException` so the sandbox sees it at the
             `await` site.
             """
-            nonlocal call_counter
-            original_name = sanitized_to_original.get(sandbox_name, sandbox_name)
-            call_counter += 1
-            if call_counter > self.max_tool_calls:
-                raise RuntimeError(f'Code mode nested tool-call limit exceeded ({self.max_tool_calls})')
-            parent_id = ctx.tool_call_id or 'pyd_ai_code_mode'
-            tool_call_id = f'{parent_id}__{call_counter}'
             call_part = ToolCallPart(tool_name=original_name, args=kwargs, tool_call_id=tool_call_id)
             nested_calls[tool_call_id] = call_part
 
@@ -699,6 +727,15 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
             run_state.reset()
             raise ModelRetry(
                 'The code crashed the sandbox worker and the session was reset. Revise the code and try again.'
+            ) from e
+        except _ToolCallBudgetExceeded as e:
+            # The budget is refused host-side, so the feed stays suspended at the refused call
+            # rather than returning to idle. Drop the session as the generic handler below does.
+            run_state.reset()
+            raise ModelRetry(
+                f'This code dispatched more than {self.max_tool_calls} nested tool calls, the limit for one '
+                '`run_code` call, and the session was reset. Call fewer tools, for example by filtering the '
+                'inputs first or splitting the work across several `run_code` calls.'
             ) from e
         except Exception as e:
             # The session may have been invalidated by a host-side binding or protocol failure.

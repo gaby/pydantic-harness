@@ -12,7 +12,7 @@ import asyncio
 import functools
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 from unittest.mock import MagicMock
 
 import pytest
@@ -35,7 +35,7 @@ from pydantic_monty import NOT_HANDLED, Monty, MountDir, OSAccess, OsFunction
 from typing_extensions import Never, TypedDict
 
 from pydantic_ai_harness import CodeMode
-from pydantic_ai_harness.code_mode import CodeModeToolset
+from pydantic_ai_harness.code_mode import CodeModeResourceLimits, CodeModeToolset
 from pydantic_ai_harness.code_mode._toolset import (  # pyright: ignore[reportPrivateUsage]
     _SEARCH_TOOLS_MODIFIER,
     _TOOL_SEARCH_ADDENDUM,
@@ -501,18 +501,72 @@ class TestCodeMode:
         assert result.return_value == 8
 
     async def test_run_code_caps_nested_tool_calls(self) -> None:
+        """A snippet that exceeds `max_tool_calls` ends with a retry naming the limit."""
         wrapper = CodeMode[object](max_tool_calls=2).get_wrapper_toolset(_build_function_toolset(add))
         assert isinstance(wrapper, CodeModeToolset)
         ctx = await build_ctx(None, wrapper)
         tools = await wrapper.get_tools(ctx)
 
-        with pytest.raises(ModelRetry, match=r'nested tool-call limit exceeded \(2\)'):
+        with pytest.raises(ModelRetry, match=r'more than 2 nested tool calls'):
             await wrapper.call_tool(
                 'run_code',
                 {'code': 'import asyncio\nawait asyncio.gather(add(a=1, b=1), add(a=2, b=2), add(a=3, b=3))'},
                 ctx,
                 tools['run_code'],
             )
+
+    async def test_nested_call_budget_is_reserved_before_dispatch(self) -> None:
+        """Calls past the budget never run, so a gather cannot outrun the limit before it bites.
+
+        The executor schedules each deferred call as a task without yielding in between, so a
+        budget checked inside the dispatch coroutine would admit every call in the gather.
+        """
+        executed: list[int] = []
+
+        def record(value: int) -> int:
+            """Record a call."""
+            executed.append(value)
+            return value
+
+        wrapper = CodeMode[object](max_tool_calls=3).get_wrapper_toolset(_build_function_toolset(record))
+        assert isinstance(wrapper, CodeModeToolset)
+        ctx = await build_ctx(None, wrapper)
+        tools = await wrapper.get_tools(ctx)
+
+        await wrapper.call_tool(
+            'run_code',
+            {'code': 'import asyncio\nawait asyncio.gather(*[record(value=i) for i in range(3)])'},
+            ctx,
+            tools['run_code'],
+        )
+        assert sorted(executed) == [0, 1, 2]
+
+        executed.clear()
+        with pytest.raises(ModelRetry, match=r'more than 3 nested tool calls'):
+            await wrapper.call_tool(
+                'run_code',
+                {'code': 'import asyncio\nawait asyncio.gather(*[record(value=i) for i in range(50)])'},
+                ctx,
+                tools['run_code'],
+            )
+
+        # The refusal happens while the executor is still scheduling, before any dispatched task
+        # has been given the event loop, so none of the 50 calls reaches the tool.
+        assert executed == []
+
+    async def test_resource_limits_accept_overrides_and_unlimited(self) -> None:
+        """Both an explicit cap and `'unlimited'` reach the sandbox session."""
+        options: list[CodeModeResourceLimits | Literal['unlimited']] = [
+            {'max_duration_secs': 5, 'max_memory': 64 * 1024 * 1024},
+            'unlimited',
+        ]
+        for limits in options:
+            wrapper = CodeMode[object](resource_limits=limits).get_wrapper_toolset(_build_function_toolset(add))
+            assert isinstance(wrapper, CodeModeToolset)
+            ctx = await build_ctx(None, wrapper)
+            tools = await wrapper.get_tools(ctx)
+            result = await wrapper.call_tool('run_code', {'code': 'await add(a=2, b=3)'}, ctx, tools['run_code'])
+            assert result.return_value == 5
 
     async def test_resource_limit_configuration_is_validated_on_enter(self) -> None:
         invalid = CodeModeToolset[object](
@@ -653,7 +707,7 @@ class TestCodeMode:
             assert events == ['wrapped enter']
             assert wrapper._run_state is not None  # pyright: ignore[reportPrivateUsage]
             wrapper._run_state.get_session(  # pyright: ignore[reportPrivateUsage]
-                type_check=False, type_check_stubs=None
+                type_check=False, type_check_stubs=None, limits={}
             )
             assert events == ['wrapped enter', 'monty enter', 'session enter']
 

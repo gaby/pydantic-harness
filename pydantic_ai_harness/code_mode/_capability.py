@@ -86,7 +86,11 @@ class CodeMode(AbstractCapability[AgentDepsT]):
     """Maximum number of retries for the `run_code` tool (syntax errors count as retries)."""
 
     max_tool_calls: int = 100
-    """Maximum nested tool calls dispatched by one `run_code` invocation."""
+    """Maximum nested tool calls dispatched by one `run_code` invocation.
+
+    Budget is reserved before each call is scheduled, so a snippet cannot allocate host tasks
+    beyond this many. Exceeding it ends that `run_code` call with a model retry.
+    """
 
     _: KW_ONLY
 
@@ -97,7 +101,11 @@ class CodeMode(AbstractCapability[AgentDepsT]):
     """Host directories to expose to sandboxed `pathlib` code; each mount's `mode` controls whether writes reach the host."""
 
     resource_limits: CodeModeResourceLimits | Literal['unlimited'] | None = None
-    """Sandbox execution limits. `None` applies a 30-second and 256 MiB backstop."""
+    """Sandbox execution limits, applied to the Monty session shared by the whole agent run.
+
+    `None` applies a 30-second execution and 256 MiB heap backstop; the duration budget is spent
+    across the run rather than restarting at each `run_code` call. `'unlimited'` removes both.
+    """
 
     dynamic_catalog: bool = False
     """Keep the `run_code` tool definition cache-stable as the sandboxed toolset grows.

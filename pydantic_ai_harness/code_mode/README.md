@@ -185,11 +185,19 @@ result
 
 Printed output is limited to 10 MiB. Exceeding the limit makes `run_code` return a model retry.
 
-Each `run_code` call is also limited to 30 seconds of sandbox execution, 256 MiB of sandbox memory,
-and 100 nested tool calls. Time spent awaiting a nested tool is excluded from the sandbox execution
-timer. Override the sandbox limits with `resource_limits={'max_duration_secs': 10, 'max_memory':
-134_217_728}` and the nested-call budget with `max_tool_calls=25`. Pass
-`resource_limits='unlimited'` only when another execution boundary supplies equivalent limits.
+Sandbox execution is bounded by `resource_limits`, which defaults to 30 seconds of execution time
+and a 256 MiB heap. Monty applies these per session, and `CodeMode` checks out one session per agent
+run, so the duration budget is spent across the run rather than restarting at each `run_code` call.
+Time spent awaiting a nested tool does not count against it. Once the budget is spent, `run_code`
+returns a model retry reporting the timeout until the REPL restarts.
+
+Nested tool calls are bounded separately by `max_tool_calls`, which defaults to 100 per `run_code`
+call. The budget is reserved before each call is scheduled, so a snippet cannot allocate host tasks
+beyond it; exceeding it ends that `run_code` call with a model retry.
+
+Override them with `resource_limits={'max_duration_secs': 10, 'max_memory': 134_217_728}` and
+`max_tool_calls=25`. Pass `resource_limits='unlimited'` only when another execution boundary
+supplies equivalent limits.
 
 ## REPL state
 
@@ -356,11 +364,13 @@ from pydantic_ai_harness import CodeMode
 CodeMode(
     tools='all',          # 'all', list[str], callable, or metadata dict
     max_retries=3,        # retries on sandbox execution errors
+    max_tool_calls=100,   # nested tool calls allowed in one run_code call
     id=None,              # required when defer_loading=True
     description=None,     # one-line catalog entry shown while deferred
     defer_loading=False,
     os_access=None,       # OS behavior; custom handlers may expose host resources
     mount=None,           # host directories to share with the sandbox
+    resource_limits=None, # sandbox time and memory caps; 'unlimited' removes them
     dynamic_catalog=False,
 )
 ```
