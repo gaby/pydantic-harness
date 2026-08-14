@@ -712,6 +712,46 @@ class TestCodeMode:
         assert '1 nested tool calls started' in message
         assert "add({'a': 1, 'b': 2}) returned 3" in message
 
+    async def test_memory_exhaustion_reports_calls_without_advising_restart(self) -> None:
+        """Exceeding `max_memory` reports what already ran, but is not a reason to restart.
+
+        The session still has its duration allowance and later calls work, so the restart advice
+        would be wrong here even though the summary is just as necessary.
+        """
+        wrapper = CodeMode[object](resource_limits={'max_memory': 8 * 1024 * 1024}).get_wrapper_toolset(
+            _build_function_toolset(add)
+        )
+        assert isinstance(wrapper, CodeModeToolset)
+        ctx = await build_ctx(None, wrapper)
+        tools = await wrapper.get_tools(ctx)
+
+        with pytest.raises(ModelRetry) as exc_info:
+            await wrapper.call_tool(
+                'run_code',
+                {'code': 'r = await add(a=1, b=2)\nx = [0] * 50_000_000\nlen(x)'},
+                ctx,
+                tools['run_code'],
+            )
+
+        message = exc_info.value.message
+        assert 'memory limit exceeded' in message
+        assert "add({'a': 1, 'b': 2}) returned 3" in message
+        assert 'restart' not in message
+
+    async def test_every_sandbox_limit_has_an_exhaustion_marker(self) -> None:
+        """Every limit callers can set has to be recognizable when it trips.
+
+        The retry summary is gated on recognizing an exhausted limit, so a limit added to
+        `CodeModeResourceLimits` without a marker would silently stop reporting the calls that
+        already ran. Checking the table against the type is what turns that into a failure here
+        rather than a gap found in production.
+        """
+        from pydantic_ai_harness.code_mode._toolset import (  # pyright: ignore[reportPrivateUsage]
+            _SANDBOX_LIMIT_MARKERS,
+        )
+
+        assert set(_SANDBOX_LIMIT_MARKERS) == set(CodeModeResourceLimits.__annotations__)
+
     async def test_ordinary_runtime_error_does_not_mention_restart(self) -> None:
         """A plain exception keeps the message it always had; the hint is not bolted onto everything."""
         wrapper = CodeMode[object]().get_wrapper_toolset(_build_function_toolset(add))

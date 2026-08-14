@@ -69,30 +69,58 @@ _RETRY_VALUE_PREVIEW_CHARS = 120
 _RETRY_SUMMARY_MAX_CHARS = 2000
 
 
+# One entry per limit `CodeModeResourceLimits` exposes, mapped to the wording Monty reports when
+# it trips. Monty offers no typed marker for either, so its phrasing is load-bearing here and
+# nowhere else. `test_every_sandbox_limit_has_an_exhaustion_marker` pins these keys against the
+# TypedDict, so a limit added there without an entry here fails that test rather than silently
+# losing its retry summary, and the per-limit tests drive real exhaustion, so a Monty reword fails
+# them rather than quietly disabling recognition.
+_SANDBOX_LIMIT_MARKERS = {
+    'max_duration_secs': 'time limit exceeded',
+    'max_memory': 'memory limit exceeded',
+}
+
+
+def _exhausted_sandbox_limit(error: MontyRuntimeError) -> str | None:
+    """Which `CodeModeResourceLimits` limit this runtime error reports, or `None` for anything else.
+
+    Derived from `_SANDBOX_LIMIT_MARKERS` rather than from a check per limit, so recognising a new
+    limit is a table entry and forgetting one is a test failure.
+
+    This gates the started-call summary, so it deliberately errs toward inclusion and matches on
+    Monty's wording alone. A nested tool that fails with one of these phrases in its own message is
+    misread, and that costs nothing: the summary only states which calls really started, which is
+    true regardless of why the snippet ended. The restart guidance cannot afford the same
+    looseness and uses `_is_duration_exhausted` instead.
+    """
+    message = error.display(format='msg')
+    for limit, marker in _SANDBOX_LIMIT_MARKERS.items():
+        if marker in message:
+            return limit
+    return None
+
+
 def _is_duration_exhausted(error: MontyRuntimeError) -> bool:
     """Whether this runtime error is Monty's spent `max_duration_secs` allowance.
 
-    Two signals, because neither alone is sound. The empty traceback is the structural one: the
-    duration limit interrupts execution rather than failing at a particular operation, and Monty
-    attaches no frame to it, measured at top level and three calls deep alike. Failures that do
-    happen at a sandbox site carry at least the module frame, including an exception a nested tool
-    raised that Monty re-raised at the call site, which keeps the tool's own message. Text alone
-    would therefore misread a tool that failed with `'time limit exceeded'` in its message and
-    tell the model to discard REPL state the session is still able to use.
+    Stricter than `_exhausted_sandbox_limit` because it gates advice to restart, and a wrong
+    restart discards REPL state the session could still use. A missed one only costs the hint.
 
-    The message check then separates this from other limits. Exceeding `max_memory` reports
-    `'memory limit exceeded'` and carries a frame from the allocation that tripped it, so either
-    signal excludes it; keeping both means neither has to be sound alone. Monty exposes no typed
-    marker for either limit, so its wording is load-bearing here and nowhere else, and a reword is
-    one edit in this function. `test_duration_exhaustion_points_at_restart` drives a real
-    exhausted session rather than a fixed string, so a reword fails that test instead of quietly
-    dropping the hint, and `test_tool_error_resembling_a_timeout_is_not_treated_as_exhaustion`
-    pins the false-positive side.
+    The empty traceback is the structural signal: the duration limit interrupts execution rather
+    than failing at a particular operation, and Monty attaches no frame to it, measured at top
+    level and three calls deep alike. Failures that happen at a sandbox site carry at least the
+    module frame, including an exception a nested tool raised that Monty re-raised at the call
+    site, which keeps the tool's own message. Wording alone would therefore misread a tool that
+    failed with `'time limit exceeded'` in its message.
+
+    Exceeding `max_memory` is excluded by either signal, since it reports different wording and
+    carries a frame from the allocation that tripped it. Keeping both means neither has to be
+    sound alone.
 
     Callers must read `False` as "add nothing", not as "not a timeout". A miss leaves the ordinary
     runtime-error message intact, which is the behaviour that shipped before the hint existed.
     """
-    return not error.traceback() and 'time limit exceeded' in error.display(format='msg')
+    return not error.traceback() and _exhausted_sandbox_limit(error) == 'max_duration_secs'
 
 
 def _preview(value: object) -> str:
@@ -118,6 +146,9 @@ def _describe_started_calls(calls: dict[str, ToolCallPart], returns: dict[str, T
     used = 0
     for call_id, call in calls.items():
         result = returns.get(call_id)
+        # `ToolReturnPart.outcome` also allows 'failed' and 'interrupted', but this function only
+        # ever sees parts built above, which set 'denied' or leave the default 'success'. Record
+        # any further outcome here rather than letting it fall through and read as a return.
         if result is None:
             outcome = 'raised, so it may have applied a partial change'
         elif result.outcome == 'denied':
@@ -809,11 +840,13 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
             # semantics are the same -- the model gets another chance.
             message = f'Runtime error:\n{capture.prepend_to(e.display())}'
             duration_spent = _is_duration_exhausted(e)
-            if nested_calls and (budget_exhausted or duration_spent):
+            if nested_calls and (budget_exhausted or _exhausted_sandbox_limit(e) is not None):
                 # A retry is the only record the model gets of an uncaught failure, and these
                 # calls already started. Without them the model reruns their side effects when
-                # it retries. That matters most on the duration path, where the advice is to
-                # restart, which discards the REPL state it would otherwise reconstruct from.
+                # it retries. Asking which limit tripped, rather than testing one flag per limit,
+                # is what keeps a newly added limit from quietly losing this. It matters most on
+                # the duration path, where the advice is to restart, which discards the REPL state
+                # the model would otherwise reconstruct from.
                 message += f'\n\n{_describe_started_calls(nested_calls, nested_returns)}'
             if duration_spent:
                 # This error keeps the session, so every later call fails on arrival too. Left
