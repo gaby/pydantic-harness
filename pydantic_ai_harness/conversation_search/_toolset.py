@@ -4,8 +4,9 @@ The ranking and rendering core is ported from VStorm's `pydantic-deepagents`
 (`pydantic_deep/features/history_archive/toolset.py`). BM25 tuning is dependency-free
 (`math` + `re`) and takes its parameters from the owning capability instead of module
 constants, so a caller can tune ranking without editing the port. The corpus comes
-from a `HistorySource` (one document per persisted message, across all runs); ranking
-is global, while context windows around a match stay within the match's run.
+from a `HistorySource` (one document per persisted message, across the runs selected
+by the configured scope); ranking is global within that scope, while context windows
+around a match stay within the match's run.
 """
 
 from __future__ import annotations
@@ -38,9 +39,9 @@ from typing_extensions import assert_never
 from pydantic_ai_harness.conversation_search._source import SUMMARY_PREFIX, HistorySource
 
 SEARCH_HISTORY_DESCRIPTION = """\
-Search all persisted conversation history: earlier turns of this conversation \
+Search persisted conversation history: earlier turns of this conversation \
 (including messages that context compaction dropped from the live context) and \
-past runs persisted in the same store.
+past runs reachable under the configured scope.
 
 When the conversation is compacted, older messages are replaced by a summary in \
 the active context, but the persisted step history keeps the originals. Use this \
@@ -68,11 +69,10 @@ _CONVERSATION_SCOPE_NOTE = (
 SearchScope = Literal['all', 'conversation']
 """How much of the store one search may reach.
 
-`all` searches every run the source enumerates -- the shape pydantic-ai-harness#124
-asks for, and correct when the store holds a single principal's history. `conversation`
-restricts the corpus to runs whose `conversation_id` matches the calling run's, which is
-what a store shared across users or tenants needs: without it, any run reading that store
-can retrieve verbatim excerpts from every other conversation in it.
+`conversation` restricts the corpus to runs whose `conversation_id` matches the calling
+run's. `all` searches every run the source enumerates and must only be used when the store
+is already isolated to one principal; otherwise, a run can retrieve verbatim excerpts
+from other conversations in the store.
 """
 
 _TOKENIZE_RE = re.compile(r'\w+')
@@ -296,7 +296,7 @@ class ConversationSearchToolset(FunctionToolset[AgentDepsT]):
         context_lines: int,
         bm25_k1: float,
         bm25_b: float,
-        scope: SearchScope = 'all',
+        scope: SearchScope = 'conversation',
     ) -> None:
         super().__init__(id=tool_id)
         if max_matches < 0:

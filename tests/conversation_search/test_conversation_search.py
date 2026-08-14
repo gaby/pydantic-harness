@@ -337,7 +337,9 @@ class TestConversationSearch:
 
     async def test_recall_through_agent_tool(self) -> None:
         store = InMemoryStepStore()
-        await _seed_run(store, 'past-run', [_user('the ZEBRA passphrase is secret')])
+        await _seed_run(
+            store, 'past-run', [_user('the ZEBRA passphrase is secret')], conversation_id='test-conversation'
+        )
         calls: list[int] = []
 
         def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
@@ -351,7 +353,7 @@ class TestConversationSearch:
             FunctionModel(model_fn),
             capabilities=[ConversationSearch(SnapshotHistorySource(store))],
         )
-        result = await agent.run('find it')
+        result = await agent.run('find it', conversation_id='test-conversation')
         returned = next(
             str(part.content)
             for message in result.all_messages()
@@ -362,7 +364,9 @@ class TestConversationSearch:
 
     async def test_capability_params_flow_into_the_toolset(self) -> None:
         store = InMemoryStepStore()
-        await _seed_run(store, 'r1', [_user(f'needle entry {i} filler') for i in range(5)])
+        await _seed_run(
+            store, 'r1', [_user(f'needle entry {i} filler') for i in range(5)], conversation_id='test-conversation'
+        )
         calls: list[int] = []
 
         def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
@@ -375,7 +379,7 @@ class TestConversationSearch:
             FunctionModel(model_fn),
             capabilities=[ConversationSearch(SnapshotHistorySource(store), max_matches=1, context_lines=0)],
         )
-        result = await agent.run('recall')
+        result = await agent.run('recall', conversation_id='test-conversation')
         rendered = next(
             str(part.content)
             for message in result.all_messages()
@@ -401,9 +405,13 @@ class TestConversationSearch:
                 ),
             ],
         )
-        result = await writer.run('the CRIMSON marker is important')
-        result = await writer.run('second turn', message_history=result.all_messages())
-        result = await writer.run('third turn', message_history=result.all_messages())
+        result = await writer.run('the CRIMSON marker is important', conversation_id='test-conversation')
+        result = await writer.run(
+            'second turn', message_history=result.all_messages(), conversation_id='test-conversation'
+        )
+        result = await writer.run(
+            'third turn', message_history=result.all_messages(), conversation_id='test-conversation'
+        )
         live = ' '.join(str(part) for message in result.all_messages() for part in message.parts)
         assert 'SUMMARY TEXT' in live
 
@@ -419,7 +427,7 @@ class TestConversationSearch:
             FunctionModel(model_fn),
             capabilities=[ConversationSearch(SnapshotHistorySource(store))],
         )
-        recall = await searcher.run('what was the marker?')
+        recall = await searcher.run('what was the marker?', conversation_id='test-conversation')
         returned = next(
             str(part.content)
             for message in recall.all_messages()
@@ -484,9 +492,9 @@ class TestSearchScope:
         await _seed_run(store, 'r-bob', [_user('remind me about the passport thing')], conversation_id='conv-bob')
         return store
 
-    async def test_default_scope_spans_every_conversation(self) -> None:
+    async def test_all_scope_spans_every_conversation(self) -> None:
         source = SnapshotHistorySource(await self._two_conversation_store())
-        rendered = await _search(source, 'passport', conversation_id='conv-bob')
+        rendered = await _search(source, 'passport', scope='all', conversation_id='conv-bob')
         assert 'X99881234' in rendered
         assert 'conversation: conv-alice' in rendered
 
@@ -515,10 +523,10 @@ class TestSearchScope:
     async def test_conversation_scope_is_announced_in_the_tool_description(self) -> None:
         source = SnapshotHistorySource(InMemoryStepStore())
         scoped: ConversationSearchToolset[None] = ConversationSearchToolset(
-            source, tool_id='t', max_matches=10, context_lines=5, bm25_k1=1.5, bm25_b=0.75, scope='conversation'
+            source, tool_id='t', max_matches=10, context_lines=5, bm25_k1=1.5, bm25_b=0.75
         )
         unscoped: ConversationSearchToolset[None] = ConversationSearchToolset(
-            source, tool_id='t', max_matches=10, context_lines=5, bm25_k1=1.5, bm25_b=0.75
+            source, tool_id='t', max_matches=10, context_lines=5, bm25_k1=1.5, bm25_b=0.75, scope='all'
         )
         scoped_tools = await scoped.get_tools(_run_context())
         unscoped_tools = await unscoped.get_tools(_run_context())
@@ -527,13 +535,13 @@ class TestSearchScope:
         assert 'only the current conversation' in scoped_description
         assert 'only the current conversation' not in unscoped_description
 
-    async def test_capability_scope_reaches_the_tool(self) -> None:
-        """The end-to-end path: `ConversationSearch(scope=...)` through `Agent` to the tool result."""
+    async def test_capability_default_scope_reaches_the_tool(self) -> None:
+        """The end-to-end path defaults to keeping another conversation out of the tool result."""
         store = await self._two_conversation_store()
         agent = Agent(
             TestModel(call_tools=['search_conversation_history']),
             capabilities=[
-                ConversationSearch(SnapshotHistorySource(store), scope='conversation'),
+                ConversationSearch(SnapshotHistorySource(store)),
             ],
         )
         result = await agent.run('find the passport detail', conversation_id='conv-bob')
@@ -546,8 +554,8 @@ class TestSearchScope:
         assert 'conv-alice' not in returned
         assert 'X99881234' not in returned
 
-    def test_scope_default_is_store_wide(self) -> None:
-        assert ConversationSearch(SnapshotHistorySource(InMemoryStepStore())).scope == 'all'
+    def test_scope_default_is_conversation(self) -> None:
+        assert ConversationSearch(SnapshotHistorySource(InMemoryStepStore())).scope == 'conversation'
 
     async def test_context_window_stays_within_run(self) -> None:
         store = InMemoryStepStore()

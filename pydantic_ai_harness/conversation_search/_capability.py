@@ -15,7 +15,7 @@ from pydantic_ai_harness.conversation_search._toolset import ConversationSearchT
 _INSTRUCTIONS = (
     'A `search_conversation_history` tool can retrieve exact details from persisted history: '
     'earlier turns that context compaction has since dropped from the live context, and past '
-    'runs persisted in the same store. Reach for it when the current context, or a compaction '
+    'runs in the same conversation. Reach for it when the current context, or a compaction '
     'summary, lacks a detail you need.'
 )
 
@@ -27,7 +27,8 @@ class ConversationSearch(AbstractCapability[AgentDepsT]):
     This capability persists nothing itself: it reads whatever history a persistence
     capability already stores, through a `HistorySource`. Pair it with
     `StepPersistence` sharing the same store, and the model can recall what
-    compaction dropped from the live context as well as anything from past runs:
+    compaction dropped from the live context as well as anything from past runs in
+    the same conversation:
 
     ```python
     from pydantic_ai import Agent
@@ -60,15 +61,14 @@ class ConversationSearch(AbstractCapability[AgentDepsT]):
     """Where the search corpus comes from. Use `SnapshotHistorySource` over the
     store a `StepPersistence` capability writes to."""
 
-    scope: SearchScope = 'all'
+    scope: SearchScope = 'conversation'
     """How much of the store one search may reach.
 
-    `all` searches every run the source enumerates. `conversation` restricts the
-    corpus to runs whose `conversation_id` matches the calling run's, which a store
-    shared across users or tenants needs: with `all`, any run reading that store can
-    retrieve verbatim excerpts from every other conversation in it. Under
-    `conversation`, a run with no `conversation_id` searches nothing and the tool says
-    so, rather than falling back to every other unlabelled run.
+    `conversation` restricts the corpus to runs whose `conversation_id` matches the
+    calling run's. A run with no `conversation_id` searches nothing and the tool says
+    so, rather than falling back to every other unlabelled run. `all` searches every
+    run the source enumerates and must only be used when the store is already isolated
+    to one principal.
     """
 
     tool_id: str = 'conversation-search'
