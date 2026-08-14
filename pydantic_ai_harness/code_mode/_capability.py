@@ -104,8 +104,9 @@ class CodeMode(AbstractCapability[AgentDepsT]):
     """Sandbox execution limits, applied per Monty session.
 
     `None` applies a 30-second execution and 256 MiB heap backstop. `max_duration_secs` bounds a
-    single snippet, not the run: consecutive calls share one session allowance, and any reset of
-    the session (`restart: true`, a crash, a type error, a host-side failure) starts a fresh one.
+    single snippet, not the run: consecutive calls share one session allowance, and anything that
+    replaces the session starts a fresh one -- `restart: true`, or any failure that leaves the
+    session unusable rather than idle and intact.
     It is not enforced in Temporal workflow code, where replay would re-measure it; `CodeMode`
     drops it there and warns. Other durability integrations, DBOS among them, enforce it normally,
     and `max_memory` is never dropped. `'unlimited'` removes both caps.

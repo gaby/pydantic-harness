@@ -2831,10 +2831,17 @@ class TestCodeMode:
         run_code = tools['run_code']
 
         await wrapper.call_tool('run_code', {'code': 'x = 1'}, ctx, run_code)
+        run_state = wrapper._run_state  # pyright: ignore[reportPrivateUsage]
+        assert run_state is not None
+        before = run_state.session
         with monkeypatch.context() as patcher:
             patcher.setattr('pydantic_ai_harness._monty_exec.MontyExecutor.run', _panic)
             with pytest.raises(ModelRetry, match='aborted inside the sandbox'):
                 await wrapper.call_tool('run_code', {'code': 'x'}, ctx, run_code)
+        # The session object is replaced, not just emptied. The duration allowance is per session,
+        # so this is what makes the docs' "each replacement renews the allowance" true of a panic
+        # as well -- it is a separate branch from the worker crash, with its own retry message.
+        assert run_state.session is not before
         with pytest.raises(ModelRetry, match='Type error in code'):
             await wrapper.call_tool('run_code', {'code': 'x'}, ctx, run_code)
 
