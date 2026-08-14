@@ -186,9 +186,10 @@ code_mode_agent = Agent(
     name='code_mode_temporal_agent',
     toolsets=[FunctionToolset(tools=[add], id='math')],
     # Default limits on purpose. Under Temporal, `CodeMode` drops `max_duration_secs` and keeps
-    # `max_memory`, and this is the only test that puts that decision through Temporal's sandboxed
-    # module loading and replay rather than through a monkeypatched `in_workflow()`. Configuring
-    # `resource_limits='unlimited'` here would clear both limits and leave nothing of it to run.
+    # `max_memory`. The unit tests reach that decision through a monkeypatched `in_workflow()`;
+    # this file is where it goes through Temporal's own sandboxed module loading and replay.
+    # Configuring `resource_limits='unlimited'` here would clear both limits and leave none of it
+    # to run.
     capabilities=[CodeMode(), TemporalDurability(activity_config=BASE_ACTIVITY_CONFIG)],
 )
 
