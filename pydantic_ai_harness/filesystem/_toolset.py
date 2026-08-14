@@ -404,7 +404,12 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
                 if not resolved_file.is_relative_to(self._real_root):
                     continue
                 raw = resolved_file.read_bytes()
-            except OSError:  # pragma: no cover
+            # A symlink cycle reaches `resolve` only if the entry is swapped after
+            # `is_file` above. `Path.resolve` reports the cycle as `RuntimeError` on
+            # 3.10-3.12 and as `OSError` from 3.13 on, where pathlib moved onto
+            # `os.path.realpath`. `_recoverable` converts neither, so skipping the
+            # entry here keeps one unreadable path from aborting the run.
+            except (OSError, RuntimeError):  # pragma: no cover
                 continue
             if _is_binary(raw):
                 continue

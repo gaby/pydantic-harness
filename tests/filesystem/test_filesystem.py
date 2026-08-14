@@ -601,6 +601,21 @@ class TestSearchFiles:
 
         assert result == 'No matches found.'
 
+    async def test_search_skips_symlink_cycles(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
+        """A cycle in the tree is skipped, not raised, on every supported Python.
+
+        `Path.resolve` reports a cycle as `RuntimeError` on 3.10-3.12 and as
+        `OSError` from 3.13 on, and `_recoverable` converts neither, so a cycle
+        reaching `resolve` would abort the run instead of returning matches.
+        """
+        (fs_root / 'real.txt').write_text('cycle needle\n')
+        (fs_root / 'loop').symlink_to(fs_root / 'loop2')
+        (fs_root / 'loop2').symlink_to(fs_root / 'loop')
+
+        result = await toolset.search_files('cycle needle')
+
+        assert result == 'real.txt:1:cycle needle'
+
 
 class TestFindFiles:
     async def test_find_glob(self, toolset: FileSystemToolset[None]) -> None:
