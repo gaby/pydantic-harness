@@ -61,6 +61,52 @@ CodeModeOS = AbstractOS | CodeModeOSCallback
 CodeModeMount = MountDir | list[MountDir]
 
 
+# Bounds for the nested-call summary appended to a budget-exhaustion retry. Monty caps printed
+# output at 10 MiB by raising, which suits a stream the model asked for but not a summary the
+# host adds to an error, so these are separate and much smaller: the summary exists to identify
+# calls, not to redeliver their payloads.
+_RETRY_VALUE_PREVIEW_CHARS = 120
+_RETRY_SUMMARY_MAX_CHARS = 2000
+
+
+def _preview(value: object) -> str:
+    """Render a value for an error message, bounded so one large payload cannot flood the prompt."""
+    text = repr(value)
+    if len(text) <= _RETRY_VALUE_PREVIEW_CHARS:
+        return text
+    return f'{text[:_RETRY_VALUE_PREVIEW_CHARS]}... ({len(text)} chars total)'
+
+
+def _describe_started_calls(calls: dict[str, ToolCallPart], returns: dict[str, ToolReturnPart]) -> str:
+    """Summarize every nested call that started, with what became of each.
+
+    Keyed off `calls` rather than `returns` because a call that raised has no recorded return, and
+    a tool can commit a side effect before raising. Those are the calls most likely to have left
+    partial state, so omitting them would hide exactly what the model needs to check.
+    """
+    lines: list[str] = []
+    used = 0
+    for call_id, call in calls.items():
+        result = returns.get(call_id)
+        if result is None:
+            outcome = 'raised, so it may have applied a partial change'
+        elif result.outcome == 'denied':
+            outcome = 'was denied and did not run'
+        else:
+            outcome = f'returned {_preview(result.content)}'
+        line = f'- {call.tool_name}({_preview(call.args)}) {outcome}'
+        if used + len(line) > _RETRY_SUMMARY_MAX_CHARS:
+            lines.append(f'- ... and {len(calls) - len(lines)} more not shown')
+            break
+        lines.append(line)
+        used += len(line)
+    return (
+        f'{len(calls)} nested tool calls started before the limit was reached:\n'
+        + '\n'.join(lines)
+        + '\nTake these into account before retrying so completed work is not repeated.'
+    )
+
+
 class CodeModeResourceLimits(TypedDict, total=False):
     """Caps on the sandbox code executed by `run_code`.
 
@@ -732,18 +778,11 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
             # (ModelRetry → MontyRuntimeError → ModelRetry), but the retry
             # semantics are the same -- the model gets another chance.
             message = f'Runtime error:\n{capture.prepend_to(e.display())}'
-            if budget_exhausted and nested_returns:
-                # A retry is the only record the model gets of an uncaught failure, and the
-                # calls below already ran. Without naming them the model reruns their side
-                # effects when it retries with a smaller batch.
-                completed = '\n'.join(
-                    f'- {part.tool_name}({nested_calls[call_id].args!r}) -> {part.content!r}'
-                    for call_id, part in nested_returns.items()
-                )
-                message += (
-                    f'\n\nThese {len(nested_returns)} nested tool calls completed before the limit '
-                    f'was reached. Do not call them again:\n{completed}'
-                )
+            if budget_exhausted and nested_calls:
+                # A retry is the only record the model gets of an uncaught failure, and these
+                # calls already started. Without them the model reruns their side effects when
+                # it retries with a smaller batch.
+                message += f'\n\n{_describe_started_calls(nested_calls, nested_returns)}'
             raise ModelRetry(message) from e
         except MontyCrashedError as e:
             # The worker died mid-feed (e.g. the code exhausted its memory or hit the

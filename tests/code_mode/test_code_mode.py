@@ -624,9 +624,120 @@ class TestCodeMode:
 
         assert executed == [0, 1, 2]
         message = exc_info.value.message
-        assert 'These 3 nested tool calls completed' in message
+        assert '3 nested tool calls started before the limit was reached' in message
         for value in (0, 1, 2):
-            assert f"record({{'value': {value}}}) -> {value}" in message
+            assert f"record({{'value': {value}}}) returned {value}" in message
+
+    async def test_budget_retry_names_calls_that_raised(self) -> None:
+        """A call that raised is listed too, since a tool can apply a change before failing.
+
+        It has no recorded return, so summarizing from the returns alone would stay silent about
+        exactly the calls most likely to have left partial state.
+        """
+
+        def flaky(value: int) -> int:
+            """Raise for one particular value."""
+            if value == 1:
+                raise ValueError('failed after doing work')
+            return value
+
+        wrapper = CodeMode[object](max_tool_calls=3).get_wrapper_toolset(_build_function_toolset(flaky))
+        assert isinstance(wrapper, CodeModeToolset)
+        ctx = await build_ctx(None, wrapper)
+        tools = await wrapper.get_tools(ctx)
+
+        with pytest.raises(ModelRetry) as exc_info:
+            await wrapper.call_tool(
+                'run_code',
+                {
+                    'code': (
+                        'o = []\n'
+                        'for i in range(10):\n'
+                        '    try:\n'
+                        '        o.append(await flaky(value=i))\n'
+                        '    except ValueError:\n'
+                        '        pass\n'
+                        'o'
+                    )
+                },
+                ctx,
+                tools['run_code'],
+            )
+
+        message = exc_info.value.message
+        assert "flaky({'value': 1}) raised, so it may have applied a partial change" in message
+        assert "flaky({'value': 0}) returned 0" in message
+
+    async def test_budget_retry_marks_denied_calls_as_not_run(self) -> None:
+        """A denied call is called out as not having run.
+
+        It has a recorded return, so lumping it in with the successes would tell the model not to
+        repeat a call whose tool never executed.
+        """
+        from pydantic_ai.capabilities import HandleDeferredToolCalls
+        from pydantic_ai.exceptions import ApprovalRequired as _ApprovalRequired
+        from pydantic_ai.tools import DeferredToolRequests, DeferredToolResults, ToolDenied
+
+        def needs_approval(value: int) -> str:
+            """A tool that requires approval."""
+            raise _ApprovalRequired()
+
+        async def handler(ctx: RunContext[object], requests: DeferredToolRequests) -> DeferredToolResults:
+            return DeferredToolResults(
+                approvals={call.tool_call_id: ToolDenied(message='nope') for call in requests.approvals}
+            )
+
+        wrapper = CodeMode[object](max_tool_calls=1).get_wrapper_toolset(_build_function_toolset(needs_approval))
+        assert isinstance(wrapper, CodeModeToolset)
+        ctx = await build_ctx(None, wrapper, root_capability=HandleDeferredToolCalls(handler=handler))
+        tools = await wrapper.get_tools(ctx)
+
+        with pytest.raises(ModelRetry) as exc_info:
+            await wrapper.call_tool(
+                'run_code',
+                {
+                    'code': (
+                        'try:\n'
+                        '    await needs_approval(value=1)\n'
+                        'except Exception:\n'
+                        '    pass\n'
+                        'await needs_approval(value=2)'
+                    )
+                },
+                ctx,
+                tools['run_code'],
+            )
+
+        assert "needs_approval({'value': 1}) was denied and did not run" in exc_info.value.message
+
+    async def test_budget_retry_bounds_previews_and_total_size(self) -> None:
+        """Arguments and results are previewed, and the whole summary is capped.
+
+        Without both bounds a snippet returning large payloads turns the retry into a prompt far
+        larger than the output the model asked for.
+        """
+
+        def bulky(value: int) -> str:
+            """Return a large payload."""
+            return 'x' * 50_000
+
+        wrapper = CodeMode[object](max_tool_calls=30).get_wrapper_toolset(_build_function_toolset(bulky))
+        assert isinstance(wrapper, CodeModeToolset)
+        ctx = await build_ctx(None, wrapper)
+        tools = await wrapper.get_tools(ctx)
+
+        with pytest.raises(ModelRetry) as exc_info:
+            await wrapper.call_tool(
+                'run_code',
+                {'code': 'o = []\nfor i in range(40):\n    o.append(await bulky(value=i))\no'},
+                ctx,
+                tools['run_code'],
+            )
+
+        message = exc_info.value.message
+        assert len(message) < 5_000, f'summary grew to {len(message)} chars'
+        assert 'chars total)' in message
+        assert 'more not shown' in message
 
     async def test_exhausted_budget_on_sequential_tool_preserves_completed_calls(self) -> None:
         """The budget refusal reaches the sandbox for inline-resolved tools too.
