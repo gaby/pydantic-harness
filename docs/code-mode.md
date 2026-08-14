@@ -170,14 +170,19 @@ Reserve `print()` for supplementary logging: printed text is surfaced separately
 Printed output is limited to 10 MiB. Exceeding the limit makes `run_code` return a model retry.
 
 Sandbox execution is bounded by `resource_limits`, which defaults to 30 seconds of execution time
-and a 256 MiB heap. Monty applies these per session, and `CodeMode` checks out one session per agent
-run, so the duration budget is spent across the run rather than restarting at each `run_code` call.
-Time spent awaiting a nested tool does not count against it. Once the budget is spent, `run_code`
-returns a model retry reporting the timeout until the REPL restarts.
+and a 256 MiB heap. Monty applies both per sandbox session, and a session lasts from the first
+`run_code` call until the REPL restarts. Two consequences follow. Consecutive `run_code` calls draw
+down one shared duration budget rather than getting 30 seconds each, and restarting the REPL (a
+`restart: true` call, or a failure that resets the session) starts a fresh budget. What holds in
+every case is the per-snippet bound: no single snippet runs longer than `max_duration_secs` of
+sandbox time, which is what stops a runaway loop. Time spent awaiting a nested tool is excluded from
+that timer. Once a session's budget is spent, `run_code` returns a model retry reporting the timeout
+until the REPL restarts.
 
 Nested tool calls are bounded separately by `max_tool_calls`, which defaults to 100 per `run_code`
-call. The budget is reserved before each call is scheduled, so a snippet cannot allocate host tasks
-beyond it; exceeding it ends that `run_code` call with a model retry.
+call. The budget is reserved before each call is scheduled, so a snippet cannot dispatch more work
+than it allows. A call past the budget fails at its call site inside the sandbox, so a snippet that
+catches the error keeps the results of the calls that already completed and can return them.
 
 Override them with `resource_limits={'max_duration_secs': 10, 'max_memory': 134_217_728}` and
 `max_tool_calls=25`. Pass `resource_limits='unlimited'` only when another execution boundary

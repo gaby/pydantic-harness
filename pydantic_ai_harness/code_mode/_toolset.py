@@ -61,15 +61,12 @@ CodeModeOS = AbstractOS | CodeModeOSCallback
 CodeModeMount = MountDir | list[MountDir]
 
 
-class _ToolCallBudgetExceeded(Exception):
-    """A `run_code` snippet asked for more nested tool calls than its budget allows."""
-
-
 class CodeModeResourceLimits(TypedDict, total=False):
     """Caps on the sandbox code executed by `run_code`.
 
-    Monty enforces these per session. `CodeMode` checks out one session per agent run, so the
-    duration budget is spent across that run rather than restarting at each `run_code` call.
+    Monty enforces these per session, and a session lasts until the REPL restarts. Consecutive
+    `run_code` calls therefore share one duration budget, and a restart starts a fresh one; the
+    bound that holds throughout is that no single snippet runs longer than `max_duration_secs`.
     """
 
     max_duration_secs: float
@@ -358,18 +355,22 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
     max_retries: int = 3
     """Maximum number of retries for the `run_code` tool (syntax errors count as retries)."""
 
-    max_tool_calls: int = 100
+    # Keyword-only: `os_access`, `mount`, and `dynamic_catalog` shipped as positional parameters,
+    # so inserting these into the positional sequence would silently rebind existing callers'
+    # arguments (an `OSAccess` passed fourth would land in `max_tool_calls`).
+    max_tool_calls: int = field(default=100, kw_only=True)
     """Maximum nested tool calls dispatched by one `run_code` invocation.
 
     Budget is reserved before each call is scheduled, so a snippet cannot allocate host tasks
-    beyond this many. Exceeding it ends that `run_code` call with a model retry.
+    beyond this many. Calls past the budget are refused at the sandbox call site.
     """
 
-    resource_limits: CodeModeResourceLimits | Literal['unlimited'] | None = None
-    """Sandbox execution limits, applied to the Monty session shared by the whole agent run.
+    resource_limits: CodeModeResourceLimits | Literal['unlimited'] | None = field(default=None, kw_only=True)
+    """Sandbox execution limits, applied per Monty session.
 
-    `None` applies a 30-second execution and 256 MiB heap backstop; the duration budget is spent
-    across the run rather than restarting at each `run_code` call. `'unlimited'` removes both.
+    `None` applies a 30-second execution and 256 MiB heap backstop. A session lasts until the
+    REPL restarts, so the duration budget is shared by consecutive `run_code` calls and starts
+    over on restart. `'unlimited'` removes both caps.
     """
 
     os_access: CodeModeOS | None = None
@@ -601,11 +602,16 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
             `asyncio.Task` as soon as this returns, without yielding to the event loop in between.
             Counting inside the coroutine would let one `asyncio.gather` over many calls allocate a
             host task per call before the first check ran, which is the cost the budget bounds.
-            Exceeding it raises here, so no further task is created.
+            Refusing here means no task is created; the executor hands the error to the sandbox at
+            the call site, so calls that already completed keep their recorded results.
             """
             nonlocal call_counter
             if call_counter >= self.max_tool_calls:
-                raise _ToolCallBudgetExceeded
+                raise RuntimeError(
+                    f'Code mode allows {self.max_tool_calls} nested tool calls per `run_code` call '
+                    'and this snippet asked for more. Call fewer tools, for example by filtering '
+                    'the inputs first, or split the work across several `run_code` calls.'
+                )
             call_counter += 1
             parent_id = ctx.tool_call_id or 'pyd_ai_code_mode'
             original_name = sanitized_to_original.get(sandbox_name, sandbox_name)
@@ -727,15 +733,6 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
             run_state.reset()
             raise ModelRetry(
                 'The code crashed the sandbox worker and the session was reset. Revise the code and try again.'
-            ) from e
-        except _ToolCallBudgetExceeded as e:
-            # The budget is refused host-side, so the feed stays suspended at the refused call
-            # rather than returning to idle. Drop the session as the generic handler below does.
-            run_state.reset()
-            raise ModelRetry(
-                f'This code dispatched more than {self.max_tool_calls} nested tool calls, the limit for one '
-                '`run_code` call, and the session was reset. Call fewer tools, for example by filtering the '
-                'inputs first or splitting the work across several `run_code` calls.'
             ) from e
         except Exception as e:
             # The session may have been invalidated by a host-side binding or protocol failure.

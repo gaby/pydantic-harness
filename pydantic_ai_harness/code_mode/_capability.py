@@ -85,14 +85,14 @@ class CodeMode(AbstractCapability[AgentDepsT]):
     max_retries: int = 3
     """Maximum number of retries for the `run_code` tool (syntax errors count as retries)."""
 
+    _: KW_ONLY
+
     max_tool_calls: int = 100
     """Maximum nested tool calls dispatched by one `run_code` invocation.
 
     Budget is reserved before each call is scheduled, so a snippet cannot allocate host tasks
-    beyond this many. Exceeding it ends that `run_code` call with a model retry.
+    beyond this many. Calls past the budget are refused at the sandbox call site.
     """
-
-    _: KW_ONLY
 
     os_access: CodeModeOS | None = None
     """Give sandboxed code environment variables, the clock, and file I/O through a handler you provide; unset, they are unavailable."""
@@ -101,10 +101,11 @@ class CodeMode(AbstractCapability[AgentDepsT]):
     """Host directories to expose to sandboxed `pathlib` code; each mount's `mode` controls whether writes reach the host."""
 
     resource_limits: CodeModeResourceLimits | Literal['unlimited'] | None = None
-    """Sandbox execution limits, applied to the Monty session shared by the whole agent run.
+    """Sandbox execution limits, applied per Monty session.
 
-    `None` applies a 30-second execution and 256 MiB heap backstop; the duration budget is spent
-    across the run rather than restarting at each `run_code` call. `'unlimited'` removes both.
+    `None` applies a 30-second execution and 256 MiB heap backstop. A session lasts until the
+    REPL restarts, so the duration budget is shared by consecutive `run_code` calls and starts
+    over on restart. `'unlimited'` removes both caps.
     """
 
     dynamic_catalog: bool = False

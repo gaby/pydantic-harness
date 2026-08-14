@@ -507,7 +507,7 @@ class TestCodeMode:
         ctx = await build_ctx(None, wrapper)
         tools = await wrapper.get_tools(ctx)
 
-        with pytest.raises(ModelRetry, match=r'more than 2 nested tool calls'):
+        with pytest.raises(ModelRetry, match=r'allows 2 nested tool calls'):
             await wrapper.call_tool(
                 'run_code',
                 {'code': 'import asyncio\nawait asyncio.gather(add(a=1, b=1), add(a=2, b=2), add(a=3, b=3))'},
@@ -542,7 +542,7 @@ class TestCodeMode:
         assert sorted(executed) == [0, 1, 2]
 
         executed.clear()
-        with pytest.raises(ModelRetry, match=r'more than 3 nested tool calls'):
+        with pytest.raises(ModelRetry, match=r'allows 3 nested tool calls'):
             await wrapper.call_tool(
                 'run_code',
                 {'code': 'import asyncio\nawait asyncio.gather(*[record(value=i) for i in range(50)])'},
@@ -553,6 +553,104 @@ class TestCodeMode:
         # The refusal happens while the executor is still scheduling, before any dispatched task
         # has been given the event loop, so none of the 50 calls reaches the tool.
         assert executed == []
+
+    async def test_exhausted_budget_preserves_completed_calls(self) -> None:
+        """A refused call fails inside the sandbox, so work already done is not thrown away.
+
+        Sequential `await`s complete one at a time, so the calls before the budget runs out have
+        really happened and may have had side effects. Aborting the snippet there would lose the
+        record of them and invite the model to repeat them on its retry.
+        """
+        executed: list[int] = []
+
+        def record(value: int) -> int:
+            """Record a call."""
+            executed.append(value)
+            return value
+
+        wrapper = CodeMode[object](max_tool_calls=3).get_wrapper_toolset(_build_function_toolset(record))
+        assert isinstance(wrapper, CodeModeToolset)
+        ctx = await build_ctx(None, wrapper)
+        tools = await wrapper.get_tools(ctx)
+
+        result = await wrapper.call_tool(
+            'run_code',
+            {
+                'code': (
+                    'done = []\n'
+                    'for i in range(10):\n'
+                    '    try:\n'
+                    '        done.append(await record(value=i))\n'
+                    '    except Exception:\n'
+                    '        break\n'
+                    'done'
+                )
+            },
+            ctx,
+            tools['run_code'],
+        )
+
+        assert executed == [0, 1, 2]
+        assert result.return_value == [0, 1, 2]
+        assert len(result.metadata['tool_calls']) == 3
+        assert len(result.metadata['tool_returns']) == 3
+
+    async def test_exhausted_budget_on_sequential_tool_preserves_completed_calls(self) -> None:
+        """The budget refusal reaches the sandbox for inline-resolved tools too.
+
+        A `sequential=True` tool is rendered as `def` and resolved inline rather than deferred,
+        so it takes a different dispatch path than the parallel case.
+        """
+        executed: list[int] = []
+
+        def record(value: int) -> int:
+            """Record a call."""
+            executed.append(value)
+            return value
+
+        wrapper = CodeMode[object](max_tool_calls=2).get_wrapper_toolset(
+            FunctionToolset[object](tools=[Tool(record, sequential=True)])
+        )
+        assert isinstance(wrapper, CodeModeToolset)
+        ctx = await build_ctx(None, wrapper)
+        tools = await wrapper.get_tools(ctx)
+
+        result = await wrapper.call_tool(
+            'run_code',
+            {
+                'code': (
+                    'done = []\n'
+                    'for i in range(6):\n'
+                    '    try:\n'
+                    '        done.append(record(value=i))\n'
+                    '    except Exception:\n'
+                    '        break\n'
+                    'done'
+                )
+            },
+            ctx,
+            tools['run_code'],
+        )
+
+        assert executed == [0, 1]
+        assert result.return_value == [0, 1]
+
+    async def test_new_options_do_not_shift_positional_arguments(self) -> None:
+        """`CodeModeToolset` is public advanced API, so its positional order has to stay put.
+
+        `os_access`, `mount`, and `dynamic_catalog` shipped as positional parameters. Adding
+        options ahead of them would silently rebind existing callers' arguments rather than fail.
+        """
+        os_access = OSAccess(environ={'TOKEN': 'secret'})
+        mount = MountDir(virtual_path='/work', host_path='/tmp', mode='read-only')
+
+        toolset = CodeModeToolset[object](_build_function_toolset(add), 'all', 3, os_access, mount, True)
+
+        assert toolset.os_access is os_access
+        assert toolset.mount is mount
+        assert toolset.dynamic_catalog is True
+        assert toolset.max_tool_calls == 100
+        assert toolset.resource_limits is None
 
     async def test_resource_limits_accept_overrides_and_unlimited(self) -> None:
         """Both an explicit cap and `'unlimited'` reach the sandbox session."""
