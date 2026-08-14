@@ -188,10 +188,13 @@ on replay and the call budget is a function of the snippet rather than of the ma
 
 Where the cap does apply, it is still not a run-wide CPU budget, and cannot be relied on as one.
 Monty applies the limits per sandbox session, so consecutive `run_code` calls draw down one shared
-allowance and each new session starts with a full one. Sessions are replaced by `restart: true` and by the failures that reset the
-REPL: a worker crash, a type error, a host-side failure, and a syntax error before any code has run.
-Each of those renews the allowance without the model asking for a restart. An ordinary exception
-inside a snippet is not one of them.
+allowance and each new session starts with a full one. Sessions are replaced by `restart: true` and
+by the failures that reset the REPL: a worker crash, a type error, a host-side failure, and a syntax
+error on a session's first feed. Each of those renews the allowance without the model asking for a
+restart. Two things are not on that list: an ordinary exception inside a snippet, and a syntax error
+in any later snippet. The second is the easier one to misread, since that snippet's code did not run
+either -- but earlier code in the session did, so the session keeps its REPL state and its spent
+allowance, and rewriting the snippet buys back no time.
 
 Once a session's allowance is spent, every later `run_code` call fails on arrival, including
 snippets that would cost almost nothing, because they reuse the same session. Rewriting the code

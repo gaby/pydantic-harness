@@ -1461,6 +1461,40 @@ class TestCodeMode:
         assert empty_wrapper._run_state is not None  # pyright: ignore[reportPrivateUsage]
         assert empty_wrapper._run_state.session is None  # pyright: ignore[reportPrivateUsage]
 
+    async def test_later_syntax_error_keeps_the_session_and_its_spent_allowance(self) -> None:
+        """A syntax error after a successful feed keeps the session; only a first-feed one resets it.
+
+        Both snippets fail without running, so "no code ran" does not separate them. What does is
+        whether the session ran anything earlier: `fresh_repl` is false once a feed has executed, so
+        the reset is skipped and the session keeps its REPL state and its spent duration allowance.
+        The allowance is per session, so holding the same session is what pins it -- asserted by
+        identity rather than by timing a burn, which would race the slower CI runners.
+        """
+        wrapper = CodeMode[object]().get_wrapper_toolset(_build_function_toolset(add))
+        assert isinstance(wrapper, CodeModeToolset)
+        ctx = await build_ctx(None, wrapper)
+        tools = await wrapper.get_tools(ctx)
+        run_code = tools['run_code']
+        run_state = wrapper._run_state  # pyright: ignore[reportPrivateUsage]
+        assert run_state is not None
+
+        await wrapper.call_tool('run_code', {'code': 'x = 41\nx'}, ctx, run_code)
+        before = run_state.session
+        assert before is not None
+
+        with pytest.raises(ModelRetry, match=r'Syntax error in code'):
+            await wrapper.call_tool('run_code', {'code': 'def ('}, ctx, run_code)
+
+        assert run_state.session is before, 'a later syntax error must not replace the session'
+        result = await wrapper.call_tool('run_code', {'code': 'x + 1'}, ctx, run_code)
+        assert result.return_value == 42
+
+        # The contrast: `restart: true` is what does replace it, and the REPL state goes with it.
+        await wrapper.call_tool('run_code', {'code': '1 + 1', 'restart': True}, ctx, run_code)
+        assert run_state.session is not before
+        with pytest.raises(ModelRetry, match=r"name 'x' is not defined"):
+            await wrapper.call_tool('run_code', {'code': 'x'}, ctx, run_code)
+
     async def test_run_code_typing_error_becomes_model_retry(self) -> None:
         """A `MontyTypingError` from static type checking is translated into `ModelRetry`.
 
