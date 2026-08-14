@@ -508,7 +508,11 @@ def for_tool_result_text(
     `metadata`, `kind`, and non-text content.
 
     A non-text result has no safe text replacement. The default raises with the
-    adapter name; `on_other='allow'` deliberately skips it.
+    adapter name. `on_other='allow'` skips the whole result rather than part of
+    it: neither `return_value` nor `content` is scanned, so a `ToolReturn` with a
+    structured `return_value` reaches the model with its `content` untouched.
+    Leave `on_other` at its default and apply the detector to a field of the
+    output when a skipped result may carry sensitive `content`.
     """
 
     def guard(info: ToolResultInfo) -> GuardrailResult:

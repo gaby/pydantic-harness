@@ -159,8 +159,18 @@ caught. A redaction inside one part leaves the other parts and their metadata
 alone; only a match that straddles a boundary merges that stretch of text into a
 single part, since no smaller part can carry the replacement. When it redacts
 either channel, it preserves the `ToolReturn` metadata, kind, and non-text
-content. As with `for_text`, a non-text result raises by default; pass
-`on_other='allow'` to skip one deliberately.
+content.
+
+As with `for_text`, a non-text result raises by default. `on_other='allow'`
+skips the whole result rather than part of it: neither `return_value` nor
+`content` is scanned. A `ToolReturn` whose `return_value` is structured counts
+as a non-text result, so sensitive text in its `content` is not scanned under
+that option. The opt-out is the caller taking responsibility for the result;
+scanning `content` there would return a redaction from the branch documented as
+allowing the result, and it would still be uneven, since a structured result
+that is not a `ToolReturn` has no separate text channel to scan. When a result
+may carry sensitive `content`, leave `on_other` at its default and apply the
+detector to a field of the output instead.
 
 A detector on the input side needs a text prompt. A multimodal prompt reaches
 the guard rendered as text, so a detector that matches one returns `replace`,

@@ -642,6 +642,19 @@ class TestForToolResultText:
         assert f'context: {_OPENAI_KEY}' not in str(result.all_messages())
         assert 'context: [redacted:openai_key]' in str(result.all_messages())
 
+    def test_allowing_a_non_text_result_skips_its_content_too(self):
+        """`on_other='allow'` is an opt-out for the whole result, not a partial scan.
+
+        A `ToolReturn` carrying a structured `return_value` is a non-text result, so its
+        `content` reaches the model unscanned. Callers who need that text checked keep
+        `on_other` at its default and guard a field of the output instead.
+        """
+        result = ToolReturn({'rows': 1}, content=f'key: {_OPENAI_KEY}')
+
+        verdict = for_tool_result_text(redact_secrets, on_other='allow')(self._info(result))
+
+        assert verdict == GuardrailResult.allow()
+
     async def test_a_non_text_tool_result_must_be_allowed_explicitly(self):
         def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
             if any(isinstance(part, ToolReturnPart) for message in messages for part in message.parts):
