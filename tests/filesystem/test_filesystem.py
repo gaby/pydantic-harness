@@ -592,6 +592,40 @@ class TestSearchFiles:
         assert 'keep.py' in result
         assert 'skip.md' not in result
 
+    async def test_search_skips_denied_name_pointing_at_an_allowed_target(self, fs_root: Path) -> None:
+        # Policy applies to the discovered name too, so a denied name can't be
+        # laundered by pointing it at a file that passes on its own.
+        (fs_root / 'target.txt').write_text('findme\n')
+        (fs_root / 'blocked.secret').symlink_to(fs_root / 'target.txt')
+        ts = FileSystemToolset(
+            root_dir=fs_root,
+            allowed_patterns=[],
+            denied_patterns=['*.secret'],
+            protected_patterns=[],
+            max_read_lines=2000,
+            max_search_results=1000,
+            max_find_results=1000,
+        )
+        result = await ts.search_files('findme')
+        assert result == 'target.txt:1:findme'
+
+    async def test_search_skips_unallowed_name_pointing_at_an_allowed_target(self, fs_root: Path) -> None:
+        # The mirror case: the target matches allowed_patterns but the name the
+        # walk discovered does not, so the name stays out of the results.
+        (fs_root / 'target.py').write_text('findme\n')
+        (fs_root / 'alias.md').symlink_to(fs_root / 'target.py')
+        ts = FileSystemToolset(
+            root_dir=fs_root,
+            allowed_patterns=['*.py'],
+            denied_patterns=[],
+            protected_patterns=[],
+            max_read_lines=2000,
+            max_search_results=1000,
+            max_find_results=1000,
+        )
+        result = await ts.search_files('findme')
+        assert result == 'target.py:1:findme'
+
     async def test_search_skips_symlinks_outside_root(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
         target = fs_root.parent / 'search-symlink-target.txt'
         target.write_text('outside secret\n')

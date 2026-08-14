@@ -394,6 +394,12 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
             # neither, so an unhandled one would abort the run.
             except (OSError, ValueError, RuntimeError):
                 continue
+            # Both sides have to pass. `_safe_resolve` covers the canonical
+            # target, so an allowed name can't reach a denied file; this covers
+            # the discovered name, so a denied name can't be laundered through
+            # an allowed target.
+            if not self._is_accessible(rel_str, write=True):
+                continue
             if not real_path.is_file():
                 continue
             # Filtering and reporting stay on the discovered path so an in-root
