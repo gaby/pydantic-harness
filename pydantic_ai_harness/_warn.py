@@ -1,11 +1,8 @@
-"""Warning categories and the machinery for renamed modules and classes.
+"""Deprecation warning machinery for renamed modules and classes.
 
 Used by the compatibility shims left behind by the capability naming pass: a renamed
 module keeps a shim package at its old path, and a renamed class keeps a module-level
 `__getattr__` alias, both emitting `HarnessDeprecationWarning` through these helpers.
-
-`HarnessConfigurationWarning` covers the unrelated case of a setting that cannot take
-effect where the code is running.
 """
 
 from __future__ import annotations
@@ -24,21 +21,6 @@ class HarnessDeprecationWarning(UserWarning):
         from pydantic_ai_harness import HarnessDeprecationWarning
 
         warnings.filterwarnings('ignore', category=HarnessDeprecationWarning)
-    """
-
-
-class HarnessConfigurationWarning(UserWarning):
-    """Warning emitted when configuration cannot take effect in the current environment.
-
-    Separate from `HarnessDeprecationWarning` because nothing is deprecated: the setting is
-    valid, and something about where the code is running stops it applying. Inherits from
-    `UserWarning` for the same reason, so the divergence between what was configured and what
-    is enforced is visible by default rather than discovered later. Silence with::
-
-        import warnings
-        from pydantic_ai_harness import HarnessConfigurationWarning
-
-        warnings.filterwarnings('ignore', category=HarnessConfigurationWarning)
     """
 
 

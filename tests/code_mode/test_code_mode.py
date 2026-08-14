@@ -36,7 +36,7 @@ from pydantic_core import SchemaValidator, core_schema
 from pydantic_monty import NOT_HANDLED, Monty, MountDir, OSAccess, OsFunction
 from typing_extensions import Never, TypedDict
 
-from pydantic_ai_harness import CodeMode, HarnessConfigurationWarning
+from pydantic_ai_harness import CodeMode
 from pydantic_ai_harness.code_mode import CodeModeResourceLimits, CodeModeToolset
 from pydantic_ai_harness.code_mode._toolset import (  # pyright: ignore[reportPrivateUsage]
     _SEARCH_TOOLS_MODIFIER,
@@ -783,13 +783,15 @@ class TestCodeMode:
         """
         from pydantic_ai.messages import BinaryContent
 
-        def shapes(tag: str, rows: list[int], opts: dict[str, int]) -> dict[str, Any]:
+        def shapes(tag: str, rows: list[int], opts: dict[str, int], ratio: float) -> dict[str, Any]:
             """Return a mix of payload shapes."""
             return {
                 'text': 'z' * 50_000,
                 'raw': b'\xff' * 50_000,
                 'blob': BinaryContent(data=b'\x89PNG' * 20_000, media_type='image/png'),
-                'nested': {'a': 1, 'b': 2},
+                # `repr` of this raises above the interpreter's digit limit, which would replace
+                # the retry with a host error.
+                'huge': 10**5000,
                 'count': 7,
             }
 
@@ -807,7 +809,7 @@ class TestCodeMode:
                 'run_code',
                 {
                     'code': (
-                        "a = await shapes(tag='t', rows=[1, 2], opts={'k': 1})\n"
+                        "a = await shapes(tag='t', rows=[1, 2], opts={'k': 1}, ratio=0.5)\n"
                         'b = await many_rows()\n'
                         'c = await many_rows()\n'
                         'a'
@@ -822,8 +824,10 @@ class TestCodeMode:
         assert '50000 chars total' in message  # long text cut at the source
         assert '50000 bytes total' in message  # long bytes cut at the source
         assert '<BinaryContent>' in message  # named by type, never rendered
-        assert '{2 items}' in message  # nested container reported by size
+        assert '<int of 16610 bits>' in message  # sized, not rendered: repr would raise
+        assert '{1 items}' in message  # nested mapping argument reported by size
         assert '[2 items]' in message  # nested list argument likewise
+        assert '0.5' in message  # plain scalars still render
         assert '(50 items total)' in message  # long list cut to its first few
 
     async def test_duration_cap_is_not_enforced_in_workflow_code(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -844,14 +848,14 @@ class TestCodeMode:
 
         # Reported when the run starts, not from inside `call_tool`, where warnings-as-errors
         # would be caught and turned into a retry.
-        with pytest.warns(HarnessConfigurationWarning, match='not enforcing `max_duration_secs`'):
+        with pytest.warns(RuntimeWarning, match='not enforcing `max_duration_secs`'):
             ctx = await build_ctx(None, wrapper)
         tools = await wrapper.get_tools(ctx)
 
         # Well past 0.3 seconds of sandbox work, and it completes, so the cap is really off.
         spend_it = 'y = 0\nfor i in range(20_000_000):\n    y += i\ny'
         with warnings.catch_warnings():
-            warnings.simplefilter('error', HarnessConfigurationWarning)
+            warnings.simplefilter('error', RuntimeWarning)
             result = await wrapper.call_tool('run_code', {'code': spend_it}, ctx, tools['run_code'])
             again = await wrapper.call_tool('run_code', {'code': spend_it}, ctx, tools['run_code'])
         assert result.return_value == 199999990000000
@@ -866,12 +870,12 @@ class TestCodeMode:
         wrapper = CodeMode[object]().get_wrapper_toolset(_build_function_toolset(add))
         assert isinstance(wrapper, CodeModeToolset)
 
-        with pytest.warns(HarnessConfigurationWarning, match='not enforcing `max_duration_secs`'):
+        with pytest.warns(RuntimeWarning, match='not enforcing `max_duration_secs`'):
             await wrapper.__aenter__()
         await wrapper.__aexit__(None, None, None)
 
         with warnings.catch_warnings():
-            warnings.simplefilter('error', HarnessConfigurationWarning)
+            warnings.simplefilter('error', RuntimeWarning)
             await wrapper.__aenter__()
         await wrapper.__aexit__(None, None, None)
 
@@ -892,7 +896,7 @@ class TestCodeMode:
         # The default duration limit still counts as configured, so entering warns; this test is
         # about the other two caps surviving.
         with warnings.catch_warnings():
-            warnings.simplefilter('ignore', HarnessConfigurationWarning)
+            warnings.simplefilter('ignore', RuntimeWarning)
             ctx = await build_ctx(None, memory_capped)
         tools = await memory_capped.get_tools(ctx)
         with pytest.raises(ModelRetry, match='memory limit exceeded'):
@@ -901,7 +905,7 @@ class TestCodeMode:
         call_capped = CodeMode[object](max_tool_calls=2).get_wrapper_toolset(_build_function_toolset(add))
         assert isinstance(call_capped, CodeModeToolset)
         with warnings.catch_warnings():
-            warnings.simplefilter('ignore', HarnessConfigurationWarning)
+            warnings.simplefilter('ignore', RuntimeWarning)
             ctx2 = await build_ctx(None, call_capped)
         tools2 = await call_capped.get_tools(ctx2)
         with pytest.raises(ModelRetry, match='allows 2 nested tool calls'):
@@ -921,7 +925,7 @@ class TestCodeMode:
         wrapper = CodeMode[object](resource_limits='unlimited').get_wrapper_toolset(_build_function_toolset(add))
         assert isinstance(wrapper, CodeModeToolset)
         with warnings.catch_warnings():
-            warnings.simplefilter('error', HarnessConfigurationWarning)
+            warnings.simplefilter('error', RuntimeWarning)
             ctx = await build_ctx(None, wrapper)
         tools = await wrapper.get_tools(ctx)
 

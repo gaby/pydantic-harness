@@ -170,20 +170,22 @@ Reserve `print()` for supplementary logging: printed text is surfaced separately
 Printed output is limited to 10 MiB. Exceeding the limit makes `run_code` return a model retry.
 
 Sandbox execution is bounded by `resource_limits`, which defaults to 30 seconds of execution time
-and a 256 MiB heap. Outside a durable workflow, `max_duration_secs` gives a per-snippet ceiling: no
-single `run_code` snippet runs longer than that much sandbox time, which is what stops a runaway
-loop. Time spent awaiting a nested tool is excluded from that timer.
+and a 256 MiB heap. Outside Temporal workflow code, `max_duration_secs` gives a per-snippet
+ceiling: no single `run_code` snippet runs longer than that much sandbox time, which is what stops
+a runaway loop. Time spent awaiting a
+nested tool is excluded from that timer.
 
-Under `TemporalDurability` that ceiling does not apply. `run_code` runs in workflow code and its
-snippets are re-executed during replay, so an elapsed-time decision would be measured again rather
-than replayed from history: the same snippet could finish on the original worker and time out under
-replay load, changing whether a retry happened and so which activities the workflow scheduled.
-`CodeMode` therefore stops enforcing `max_duration_secs` in workflow code and warns once with
-`HarnessConfigurationWarning` that it is doing so. **For durable agents, nothing here bounds sandbox
-CPU time**; the applicable guidance is the one below under Temporal durability, to keep sandbox
-loops bounded in the snippets themselves. `max_memory` and `max_tool_calls` are unaffected, since a
-snippet allocates the same on replay and the call budget is a function of the snippet rather than of
-the machine.
+That ceiling is not enforced in Temporal workflow code, and nowhere else. `run_code` runs
+workflow-side under `TemporalDurability` and its snippets are re-executed during replay, so an
+elapsed-time decision would be measured again rather than replayed from history: the same snippet
+could finish on the original worker and time out under replay load, changing whether a retry
+happened and so which activities the workflow scheduled. `CodeMode` therefore drops
+`max_duration_secs` there and warns once with a `RuntimeWarning` that it is doing so. **Inside a
+Temporal workflow, nothing here bounds sandbox CPU time**; the applicable guidance is the one below
+under Temporal durability, to keep sandbox loops bounded in the snippets themselves. This is
+specific to Temporal rather than to durability in general: a DBOS workflow enforces the cap
+normally. `max_memory` and `max_tool_calls` are never dropped, since a snippet allocates the same
+on replay and the call budget is a function of the snippet rather than of the machine.
 
 Where the cap does apply, it is still not a run-wide CPU budget, and cannot be relied on as one.
 Monty applies the limits per sandbox session, so consecutive `run_code` calls draw down one shared
@@ -268,9 +270,11 @@ computation inside `run_code`, so keep sandbox loops bounded.
 That guidance is what bounds sandbox CPU time here, because `resource_limits['max_duration_secs']`
 is not enforced in workflow code. Enforcing it would re-measure elapsed time on every replay, and a
 snippet near the threshold could pass once and time out the next time, changing the recorded
-history. `CodeMode` drops the cap there and warns once with `HarnessConfigurationWarning`; the
-warning names the setting so the gap between what was configured and what applies is visible rather
-than discovered later. `max_memory` and `max_tool_calls` still apply.
+history. `CodeMode` drops the cap there and warns once with a `RuntimeWarning`; the warning names
+the setting so the gap between what was configured and what applies is visible rather than
+discovered later. `max_memory` and `max_tool_calls` still apply. A builtin warning category is used
+deliberately: the workflow sandbox re-imports harness modules, so a harness-defined category would
+be a different class than the one a filter names and could not be suppressed.
 
 Recording the decision instead of re-measuring it would be the real fix: if `run_code` ran inside a
 Temporal activity, its outcome would be written to history once and replayed rather than

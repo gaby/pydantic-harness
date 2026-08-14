@@ -52,7 +52,6 @@ except ImportError as _import_error:  # pragma: no cover
         'pydantic-monty is required for CodeMode. Install it with: pip install "pydantic-ai-harness[code-mode]"'
     ) from _import_error
 from pydantic_ai_harness._monty_exec import MontyExecutor, PrintCapture, is_sandbox_panic
-from pydantic_ai_harness._warn import HarnessConfigurationWarning
 
 # A raw OS callback. Return `pydantic_monty.NOT_HANDLED` to defer the call to the
 # sandbox's default, which leaves it unavailable.
@@ -69,6 +68,8 @@ CodeModeMount = MountDir | list[MountDir]
 # calls, not to redeliver their payloads.
 _RETRY_VALUE_PREVIEW_CHARS = 120
 _RETRY_PREVIEW_ITEMS = 5
+# Roughly the decimal digits that fit the character budget, checked before rendering an integer.
+_RETRY_INT_BITS = 400
 _RETRY_SUMMARY_MAX_CHARS = 2000
 
 
@@ -179,7 +180,13 @@ def _preview(value: Any, *, nested: bool = False) -> str:
         pairs = islice(raw.items(), items)
         rendered = ', '.join(f'{_preview(k, nested=True)}: {_preview(v, nested=True)}' for k, v in pairs)
         return '{' + rendered + '}' + _elided(len(raw), items, 'items')
-    if value is None or isinstance(value, (int, float)):
+    if isinstance(value, int) and not isinstance(value, bool):
+        # `repr` on a large int is not bounded by its own size: it builds the whole decimal
+        # expansion, and above the interpreter's digit limit it raises `ValueError` instead,
+        # which here would replace the retry with an uncaught host error. `bit_length` answers
+        # how big it is without rendering it.
+        return repr(value) if value.bit_length() <= _RETRY_INT_BITS else f'<int of {value.bit_length()} bits>'
+    if value is None or isinstance(value, (bool, float)):
         return repr(value)
     return f'<{type(value).__name__}>'
 
@@ -225,8 +232,9 @@ class CodeModeResourceLimits(TypedDict, total=False):
     """Caps on the sandbox code executed by `run_code`.
 
     Monty enforces these per session. Consecutive `run_code` calls therefore share one duration
-    allowance, and anything that resets the session starts a fresh one, so the bound that holds
-    throughout is per snippet: no single snippet runs longer than `max_duration_secs`.
+    allowance, and anything that resets the session starts a fresh one, so `max_duration_secs`
+    bounds a single snippet rather than the run. It is dropped in Temporal workflow code, where
+    replay would re-measure it and change the recorded history.
     """
 
     max_duration_secs: float
@@ -528,11 +536,12 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
     resource_limits: CodeModeResourceLimits | Literal['unlimited'] | None = field(default=None, kw_only=True)
     """Sandbox execution limits, applied per Monty session.
 
-    `None` applies a 30-second execution and 256 MiB heap backstop. The guarantee is per snippet:
-    no single `run_code` snippet runs longer than `max_duration_secs`. It is not a run-wide budget,
-    since consecutive calls share one session allowance and any reset of the session (`restart:
-    true`, a crash, a type error, a host-side failure) starts a fresh one. `'unlimited'` removes
-    both caps.
+    `None` applies a 30-second execution and 256 MiB heap backstop. `max_duration_secs` bounds a
+    single snippet, not the run: consecutive calls share one session allowance, and any reset of
+    the session (`restart: true`, a crash, a type error, a host-side failure) starts a fresh one.
+    It is not enforced in Temporal workflow code, where replay would re-measure it; `CodeMode`
+    drops it there and warns. Other durability integrations, DBOS among them, enforce it normally,
+    and `max_memory` is never dropped. `'unlimited'` removes both caps.
     """
 
     os_access: CodeModeOS | None = None
@@ -612,6 +621,12 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
         # Reported here rather than from `_session_limits`, which runs inside the handler that
         # converts exceptions into retries: a caller running with warnings as errors would have
         # turned this into a `ModelRetry`, perturbing the very history it warns about.
+        #
+        # `RuntimeWarning` rather than a harness category because this only ever fires inside the
+        # Temporal workflow sandbox, which re-imports harness modules, so a harness-defined class
+        # is a different object than the one any filter names and cannot be matched. A builtin is
+        # the same object everywhere, so this stays suppressible; the message carries the detail
+        # the category would have.
         if resolved.get('max_duration_secs') is not None and _in_temporal_workflow():
             if not self._warned_unenforced_duration:
                 self._warned_unenforced_duration = True
@@ -622,7 +637,7 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
                     'and time out on another, changing the workflow history. Bound long-running '
                     'sandbox loops in the snippets themselves; `max_memory` and `max_tool_calls` '
                     'still apply.',
-                    category=HarnessConfigurationWarning,
+                    category=RuntimeWarning,
                     stacklevel=2,
                 )
         run_state = _MontyRunState()
