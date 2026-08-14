@@ -624,6 +624,10 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
 
     Budget is reserved before each call is scheduled, so a snippet cannot allocate host tasks
     beyond this many. Calls past the budget are refused at the sandbox call site.
+
+    Must be at least 1; `__aenter__` raises `UserError` otherwise. Zero is not the way to stop a
+    snippet calling tools -- `tools=[]` is, which leaves `run_code` with no callables, though the
+    unsandboxed tools stay available to the model directly.
     """
 
     resource_limits: CodeModeResourceLimits | Literal['unlimited'] | None = field(default=None, kw_only=True)

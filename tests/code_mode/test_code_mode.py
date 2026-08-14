@@ -3782,6 +3782,29 @@ class TestCodeModeOSAccess:
         assert 'Mounted filesystem access' in description
         assert "writes through a `mode='overlay'` mount last only for the current `run_code` call" in description
 
+    async def test_empty_selector_leaves_run_code_with_nothing_to_dispatch(self) -> None:
+        """`tools=[]` is what makes a snippet unable to call tools, which `max_tool_calls=0` is not.
+
+        The docs point here for a computation-only sandbox, so the two halves of that are pinned:
+        `run_code` gets no callables, and the tool stays available to the model directly rather
+        than disappearing from the agent.
+        """
+        wrapper = CodeMode[object](tools=[]).get_wrapper_toolset(_build_function_toolset(add))
+        assert isinstance(wrapper, CodeModeToolset)
+        ctx = await build_ctx(None, wrapper)
+        tools = await wrapper.get_tools(ctx)
+
+        assert sorted(tools) == ['add', 'run_code']
+        # Nothing was sandboxed, so the catalog the model reads offers no callable.
+        description = tools['run_code'].tool_def.description
+        assert description is not None
+        assert 'async def add' not in description
+        # Computation still runs; only dispatch is gone.
+        result = await wrapper.call_tool('run_code', {'code': 'sum(i * i for i in range(10))'}, ctx, tools['run_code'])
+        assert result.return_value == 285
+        with pytest.raises(ModelRetry, match=r'Runtime error'):
+            await wrapper.call_tool('run_code', {'code': 'await add(a=1, b=2)'}, ctx, tools['run_code'])
+
     async def test_description_host_access_note_shows_with_no_sandboxed_tools(self) -> None:
         """The host-access note appears even when no tools are sandboxed (base description)."""
         # `tools=[]` sandboxes nothing, so `run_code` renders the base description path.

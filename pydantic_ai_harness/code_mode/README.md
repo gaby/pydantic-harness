@@ -226,8 +226,11 @@ choosing `max_duration_secs`: set it low and a long agent run will spend it on o
 pay a restart to continue.
 
 Nested tool calls are bounded separately by `max_tool_calls`, which defaults to 100 per `run_code`
-call. The budget is reserved before each call is scheduled, so a snippet cannot dispatch more work
-than it allows. A call past the budget fails at its call site inside the sandbox. A snippet that
+call and must be at least 1; a lower value raises `UserError` when the run starts rather than at
+the first `run_code` call. Zero is not how to stop a snippet calling tools: `tools=[]` does
+that, leaving `run_code` with no callables, though the unsandboxed tools stay available to the
+model directly. The budget is reserved before each call is scheduled, so a snippet cannot dispatch
+more work than it allows. A call past the budget fails at its call site inside the sandbox. A snippet that
 catches the error keeps the results of the calls that already completed and can return them. A
 snippet that lets it propagate gets a model retry reporting how many nested calls started,
 followed by per-call detail: what each was called with, and whether it returned, raised, or was
@@ -425,7 +428,7 @@ from pydantic_ai_harness import CodeMode
 CodeMode(
     tools='all',          # 'all', list[str], callable, or metadata dict
     max_retries=3,        # retries on sandbox execution errors
-    max_tool_calls=100,   # nested tool calls allowed in one run_code call
+    max_tool_calls=100,   # nested tool calls allowed in one run_code call; minimum 1
     id=None,              # required when defer_loading=True
     description=None,     # one-line catalog entry shown while deferred
     defer_loading=False,
