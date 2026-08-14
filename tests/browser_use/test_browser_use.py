@@ -216,7 +216,7 @@ class TestBrowserUseToolset:
         session_profile = factory.requests[0].browser_session.browser_profile
         assert session_profile.headless is True
         assert session_profile.block_ip_addresses is True
-        assert session_profile.prohibited_domains == ['localhost', 'localhost.*', '*.localhost']
+        assert session_profile.prohibited_domains == ['file://*', 'localhost', 'localhost.*', '*.localhost']
         # In 'call' scope the sub-agent may tear the session down itself; the
         # tool kills it in `finally` regardless.
         assert not session_profile.keep_alive
@@ -232,7 +232,7 @@ class TestBrowserUseToolset:
         assert session_profile.allowed_domains == ['docs.example.com']
         assert session_profile.user_agent == 'harness-test'
         assert session_profile.block_ip_addresses is True
-        assert session_profile.prohibited_domains == ['localhost', 'localhost.*', '*.localhost']
+        assert session_profile.prohibited_domains == ['file://*', 'localhost', 'localhost.*', '*.localhost']
 
     async def test_sensitive_data_disables_cross_origin_iframes_without_a_profile(
         self, kill_calls: list[BrowserSession]
@@ -322,7 +322,7 @@ class TestBrowserUseToolset:
 
         session_profile = factory.requests[0].browser_session.browser_profile
         assert session_profile.allowed_domains == expected_allowed_domains
-        assert session_profile.prohibited_domains == ['localhost', 'localhost.*', '*.localhost']
+        assert session_profile.prohibited_domains == ['file://*', 'localhost', 'localhost.*', '*.localhost']
 
     @pytest.mark.parametrize(
         'capability',
@@ -381,7 +381,7 @@ class TestBrowserUseToolset:
 
         session_profile = factory.requests[0].browser_session.browser_profile
         assert session_profile.block_ip_addresses is False
-        assert session_profile.prohibited_domains is None
+        assert session_profile.prohibited_domains == ['file://*']
 
     async def test_private_network_setting_overrides_browser_profile(self, kill_calls: list[BrowserSession]) -> None:
         factory = _success_factory()
@@ -397,6 +397,26 @@ class TestBrowserUseToolset:
         )
 
         assert factory.requests[0].browser_session.browser_profile.block_ip_addresses is False
+
+    async def test_local_files_stay_prohibited_with_custom_profile_rules(
+        self, kill_calls: list[BrowserSession]
+    ) -> None:
+        factory = _success_factory()
+
+        await (
+            BrowserUse[None](
+                browser_profile=BrowserProfile(prohibited_domains=['blocked.example', 'file://*']),
+                block_ip_addresses=False,
+                browser_agent=factory,
+            )
+            .get_toolset()
+            .browse_web('task')
+        )
+
+        assert factory.requests[0].browser_session.browser_profile.prohibited_domains == [
+            'blocked.example',
+            'file://*',
+        ]
 
     async def test_session_killed_after_success(self, kill_calls: list[BrowserSession]) -> None:
         factory = _success_factory()

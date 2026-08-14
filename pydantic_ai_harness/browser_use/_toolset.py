@@ -32,6 +32,7 @@ except ImportError as _import_error:  # pragma: no cover
 logger = logging.getLogger(__name__)
 
 _TOOL_NAME = 'browse_web'
+_LOCAL_FILE_PATTERNS = ['file://*']
 _LOCALHOST_PATTERNS = ['localhost', 'localhost.*', '*.localhost']
 _LOCALHOST_HOSTS = ('localhost', 'localhost.example', 'example.localhost')
 
@@ -379,35 +380,30 @@ class BrowserUseToolset(FunctionToolset[AgentDepsT]):
             headless = True
         browser_profile = self._browser_profile
         allowed_domains = self._allowed_domains
+        if browser_profile is None:
+            browser_profile = BrowserProfile(prohibited_domains=_LOCAL_FILE_PATTERNS)
+        else:
+            prohibited_domains = list(browser_profile.prohibited_domains or ())
+            prohibited_domains.extend(pattern for pattern in _LOCAL_FILE_PATTERNS if pattern not in prohibited_domains)
+            browser_profile = browser_profile.model_copy(update={'prohibited_domains': prohibited_domains})
         if self._sensitive_data is not None:
-            if browser_profile is None:
-                browser_profile = BrowserProfile(cross_origin_iframes=False)
-            else:
-                browser_profile = browser_profile.model_copy(update={'cross_origin_iframes': False})
+            browser_profile = browser_profile.model_copy(update={'cross_origin_iframes': False})
         if self._block_ip_addresses:
             allowed_domains = _exclude_localhost_allowlist_entries(allowed_domains)
-            if browser_profile is None:
-                browser_profile = BrowserProfile(
-                    block_ip_addresses=True,
-                    prohibited_domains=_LOCALHOST_PATTERNS,
-                )
+            if allowed_domains is None:
+                profile_allowed_domains = _exclude_localhost_allowlist_entries(browser_profile.allowed_domains)
             else:
-                if allowed_domains is None:
-                    profile_allowed_domains = _exclude_localhost_allowlist_entries(browser_profile.allowed_domains)
-                else:
-                    profile_allowed_domains = browser_profile.allowed_domains
-                prohibited_domains = list(browser_profile.prohibited_domains or ())
-                prohibited_domains.extend(
-                    pattern for pattern in _LOCALHOST_PATTERNS if pattern not in prohibited_domains
-                )
-                browser_profile = browser_profile.model_copy(
-                    update={
-                        'allowed_domains': profile_allowed_domains,
-                        'block_ip_addresses': True,
-                        'prohibited_domains': prohibited_domains,
-                    }
-                )
-        elif browser_profile is not None:
+                profile_allowed_domains = browser_profile.allowed_domains
+            prohibited_domains = list(browser_profile.prohibited_domains or ())
+            prohibited_domains.extend(pattern for pattern in _LOCALHOST_PATTERNS if pattern not in prohibited_domains)
+            browser_profile = browser_profile.model_copy(
+                update={
+                    'allowed_domains': profile_allowed_domains,
+                    'block_ip_addresses': True,
+                    'prohibited_domains': prohibited_domains,
+                }
+            )
+        else:
             browser_profile = browser_profile.model_copy(update={'block_ip_addresses': False})
         return BrowserSession(
             cdp_url=self._cdp_url,

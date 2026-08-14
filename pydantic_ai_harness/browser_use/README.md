@@ -202,9 +202,10 @@ origin.
   inside it. Non-empty custom `guidance` retains this rule automatically;
   `guidance=''` is the explicit opt-out.
 - **File actions.** The default factory disables browser-use's `read_file` and
-  `upload_file` actions. Downloaded PDFs stay out of browser-use's PDF parser,
-  and uploads need an application-specific approval or destination policy. A
-  custom factory that re-enables either action needs to provide those controls.
+  `upload_file` actions and prohibits `file://` navigation. Downloaded PDFs stay
+  out of browser-use's PDF parser, and uploads need an application-specific
+  approval or destination policy. A custom factory that re-enables either
+  action needs to provide those controls.
 - **Full browser control.** `browser_profile` accepts a complete browser-use
   `BrowserProfile` for everything the convenience fields do not cover: proxy,
   a persistent `user_data_dir` (staying logged in across calls),
