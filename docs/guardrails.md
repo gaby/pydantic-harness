@@ -153,13 +153,17 @@ ToolGuardrail(result_guard=for_tool_result_text(redact_secrets))
 ```
 
 The adapter checks a string `return_value` and all text in `content`, which core
-sends as a separate user-prompt part. Adjacent text parts are scanned both on
-their own and joined together, so a secret split across two of them is still
-caught. A redaction inside one part leaves the other parts and their metadata
-alone; only a match that straddles a boundary merges that stretch of text into a
-single part, since no smaller part can carry the replacement. When it redacts
-either channel, it preserves the `ToolReturn` metadata, kind, and non-text
-content.
+sends as a separate user-prompt part. Text parts the model reads as one span are
+scanned both on their own and joined together, so a secret split across two of
+them is still caught. A part carrying no model content does not end a span: a
+`CachePoint` between two texts is dropped by providers without caching, so the
+text either side of it is joined, while an image or document between them is not,
+since joining across real content would invent adjacency. A redaction inside one
+part leaves the other parts and their metadata alone; only a match that straddles
+a boundary merges that span into a single part, since no smaller part can carry
+the replacement, and any `CachePoint` in the span moves ahead of the merged text
+rather than being dropped. When it redacts either channel, it preserves the
+`ToolReturn` metadata, kind, and non-text content.
 
 As with `for_text`, a non-text result raises by default. `on_other='allow'`
 skips the whole result rather than part of it: neither `return_value` nor

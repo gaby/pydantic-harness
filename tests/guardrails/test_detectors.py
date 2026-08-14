@@ -9,6 +9,7 @@ from pydantic_ai import Agent
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.messages import (
     BinaryContent,
+    CachePoint,
     ModelMessage,
     ModelResponse,
     TextContent,
@@ -574,6 +575,32 @@ class TestForToolResultText:
         assert verdict == GuardrailResult.replace(
             ToolReturn('safe summary', content=['key: [redacted:openai_key]', image])
         )
+
+    def test_a_secret_split_around_a_cache_point_is_redacted(self):
+        """A `CachePoint` splits the parts but not the text, since providers without caching drop it."""
+        result = ToolReturn('safe summary', content=[f'key: {_OPENAI_KEY[:20]}', CachePoint(), _OPENAI_KEY[20:]])
+
+        verdict = for_tool_result_text(redact_secrets)(self._info(result))
+
+        assert verdict == GuardrailResult.replace(
+            ToolReturn('safe summary', content=[CachePoint(), 'key: [redacted:openai_key]'])
+        )
+
+    def test_a_cache_point_keeps_its_place_when_no_merge_is_needed(self):
+        result = ToolReturn('safe summary', content=[f'key: {_OPENAI_KEY}', CachePoint(), 'tail'])
+
+        verdict = for_tool_result_text(redact_secrets)(self._info(result))
+
+        assert verdict == GuardrailResult.replace(
+            ToolReturn('safe summary', content=['key: [redacted:openai_key]', CachePoint(), 'tail'])
+        )
+
+    def test_text_around_a_binary_part_is_not_joined(self):
+        """A `BinaryContent` is real content between the two texts, so joining them would invent adjacency."""
+        image = BinaryContent(data=b'image', media_type='image/png')
+        result = ToolReturn('safe summary', content=[f'key: {_OPENAI_KEY[:20]}', image, _OPENAI_KEY[20:]])
+
+        assert for_tool_result_text(redact_secrets)(self._info(result)) == GuardrailResult.allow()
 
     def test_a_split_secret_keeps_the_metadata_of_the_part_it_merges_into(self):
         result = ToolReturn(

@@ -49,7 +49,7 @@ from dataclasses import replace
 from typing import Literal, TypeGuard
 
 from pydantic_ai.exceptions import UserError
-from pydantic_ai.messages import TextContent, ToolReturn, UserContent
+from pydantic_ai.messages import CachePoint, TextContent, ToolReturn, UserContent
 
 from pydantic_ai_harness.guardrails._shared import GuardrailResult
 from pydantic_ai_harness.guardrails._tool_guardrail import ToolResultInfo
@@ -84,46 +84,77 @@ def _text_of(part: str | TextContent) -> str:
     return part if isinstance(part, str) else part.content
 
 
+def _carries_no_model_content(part: UserContent) -> bool:
+    """Whether `part` puts nothing in front of the model, so the text either side of it is contiguous.
+
+    `CachePoint` is a prompt-caching marker that providers without caching drop, so it separates
+    two text parts on the page but not in what the model reads. It is the only member of
+    `UserContent` like that: `str` and `TextContent` carry text, and `ImageUrl`, `AudioUrl`,
+    `DocumentUrl`, `VideoUrl`, `BinaryContent` and `UploadedFile` each put a payload in the
+    prompt, so those do separate the text around them.
+    """
+    return isinstance(part, CachePoint)
+
+
 def _rewrite_text_part(part: str | TextContent, text: str) -> str | TextContent:
     """Put `text` back in `part`, keeping the part's shape and any `TextContent.metadata`."""
     return text if isinstance(part, str) else replace(part, content=text)
 
 
 def _detect_text_run(
-    detector: TextDetector, run: Sequence[str | TextContent]
+    detector: TextDetector, run: Sequence[UserContent]
 ) -> tuple[GuardrailResult | None, Sequence[UserContent], bool]:
-    """Run `detector` over one stretch of adjacent text parts, per part and then over the whole stretch.
+    """Run `detector` over one stretch of text the model reads as one span, per part and then joined.
 
-    The model reads adjacent text parts as one span, so a secret split across two of
-    them matches nothing in either part on its own. The joined pass catches that. It
-    runs over the per-part rewrites rather than the originals, so a secret that sits
-    inside one part is redacted in place and the parts keep their own boundaries and
-    metadata. Only a match that survives per-part redaction -- one that straddles a
-    boundary -- collapses the stretch into a single part, which is the shortest text
-    that can carry the redaction.
+    The model reads that span as one string, so a secret split across two parts of it
+    matches nothing in either part on its own. The joined pass catches that. It runs
+    over the per-part rewrites rather than the originals, so a secret that sits inside
+    one part is redacted in place and the parts keep their own boundaries and metadata.
+    Only a match that survives per-part redaction -- one that straddles a boundary --
+    collapses the span into a single part, which is the shortest text that can carry
+    the redaction.
 
-    A stretch of one part is scanned once. It has no boundary for a value to straddle, so
-    the joined pass would hand `detector` the string it just saw. That matters beyond the
+    A span holding one text part is scanned once. It has no boundary for a value to straddle,
+    so the joined pass would hand `detector` the string it just saw. That matters beyond the
     wasted call: `TextDetector` is a public extension point, so a detector that is stateful
     or bills per call would otherwise see `content='x'` and `content=['x']` differently.
 
+    A span can hold parts that carry no model content, which is why the joined pass keys on
+    the number of text parts rather than the length of `run`. Those markers are kept. When a
+    straddling match collapses the span they move ahead of the merged text, because the split
+    they marked no longer exists: putting them after it would pull the text that followed a
+    `CachePoint` into the cached prefix, and widening what a caller marked as cacheable is a
+    worse failure than narrowing it.
+
     Returns a terminal verdict, the parts to keep, and whether any text changed.
     """
+    text_parts: list[str | TextContent] = []
     texts: list[str] = []
     replaced = False
     for part in run:
+        if not isinstance(part, str | TextContent):
+            continue
         verdict, replacement = _detect_content_text(detector, _text_of(part))
         if verdict is not None:
             return verdict, run, False
         replaced |= replacement is not None
+        text_parts.append(part)
         texts.append(_text_of(part) if replacement is None else replacement)
-    if len(run) > 1:
+    if len(texts) > 1:
         verdict, joined = _detect_content_text(detector, ''.join(texts))
         if verdict is not None:
             return verdict, run, False
         if joined is not None:
-            return None, [_rewrite_text_part(run[0], joined)], True
-    return None, [_rewrite_text_part(part, text) for part, text in zip(run, texts, strict=True)], replaced
+            markers = [part for part in run if not isinstance(part, str | TextContent)]
+            return None, [*markers, _rewrite_text_part(text_parts[0], joined)], True
+    rewritten: list[UserContent] = []
+    replacements = iter(texts)
+    for part in run:
+        if isinstance(part, str | TextContent):
+            rewritten.append(_rewrite_text_part(part, next(replacements)))
+        else:
+            rewritten.append(part)
+    return None, rewritten, replaced
 
 
 def _detect_tool_return_content(
@@ -139,11 +170,11 @@ def _detect_tool_return_content(
     if content is None:
         return None, None
     rewritten: list[UserContent] = []
-    run: list[str | TextContent] = []
+    run: list[UserContent] = []
     replaced = False
     # The trailing `None` flushes the last run without repeating the flush after the loop.
     for part in [*content, None]:
-        if isinstance(part, str | TextContent):
+        if part is not None and (isinstance(part, str | TextContent) or _carries_no_model_content(part)):
             run.append(part)
             continue
         verdict, parts, run_replaced = _detect_text_run(detector, run)
