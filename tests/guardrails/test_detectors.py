@@ -529,9 +529,24 @@ class TestForToolResultText:
             )
         )
 
-    def test_a_content_detector_verdict_is_preserved(self):
+    def test_unmodified_multipart_content_is_allowed(self):
+        result = ToolReturn('no secret', content=['safe context', TextContent(content='more context')])
+
+        assert for_tool_result_text(redact_secrets)(self._info(result)) == GuardrailResult.allow()
+
+    def test_a_return_value_detector_verdict_is_preserved(self):
         verdict = for_tool_result_text(blocked_keywords(['blocked']))(
-            self._info(ToolReturn('safe summary', content='blocked context'))
+            self._info(ToolReturn('blocked summary', content='safe context'))
+        )
+
+        assert verdict.action == 'block'
+
+    @pytest.mark.parametrize(
+        'content', ['blocked context', ['safe context', 'blocked context']], ids=['string', 'multipart']
+    )
+    def test_a_content_detector_verdict_is_preserved(self, content: str | list[str]):
+        verdict = for_tool_result_text(blocked_keywords(['blocked']))(
+            self._info(ToolReturn('safe summary', content=content))
         )
 
         assert verdict.action == 'block'

@@ -63,31 +63,48 @@ def _is_text_tool_return(value: object) -> TypeGuard[ToolReturn[str]]:
     return isinstance(value, ToolReturn) and isinstance(value.return_value, str)
 
 
+def _detect_content_text(detector: TextDetector, text: str) -> tuple[GuardrailResult | None, str | None]:
+    """Run `detector` over one text part of `ToolReturn.content`.
+
+    Returns a terminal verdict, or the replacement text -- `None` when the part is left alone.
+    """
+    verdict = detector(text)
+    if verdict.action not in ('allow', 'replace'):
+        return verdict, None
+    if verdict.action == 'allow':
+        return None, None
+    replacement = verdict.replacement
+    if not isinstance(replacement, str):
+        raise UserError('A text detector used with for_tool_result_text() must replace tool content with text.')
+    return None, replacement
+
+
 def _detect_tool_return_content(
     detector: TextDetector, content: str | Sequence[UserContent] | None
-) -> tuple[GuardrailResult | None, str | Sequence[UserContent] | None, bool]:
-    """Run a detector over each text-bearing part of `ToolReturn.content`."""
+) -> tuple[GuardrailResult | None, str | Sequence[UserContent] | None]:
+    """Run `detector` over every text-bearing part of `ToolReturn.content`.
+
+    Returns the first terminal verdict a part produced, or the rewritten content --
+    `None` when no part was redacted, so the caller keeps the original shape.
+    """
+    if isinstance(content, str):
+        return _detect_content_text(detector, content)
     if content is None:
-        return None, content, False
-    parts: Sequence[UserContent] = [content] if isinstance(content, str) else content
+        return None, None
     rewritten: list[UserContent] = []
     replaced = False
-    for part in parts:
+    for part in content:
         text = part if isinstance(part, str) else part.content if isinstance(part, TextContent) else None
         if text is None:
             rewritten.append(part)
             continue
-        verdict = detector(text)
-        if verdict.action not in ('allow', 'replace'):
-            return verdict, content, False
-        replacement = verdict.replacement if verdict.action == 'replace' else text
-        if not isinstance(replacement, str):
-            raise UserError('A text detector used with for_tool_result_text() must replace tool content with text.')
-        rewritten.append(replacement if isinstance(part, str) else replace(part, content=replacement))
-        replaced |= verdict.action == 'replace'
-    if not replaced:
-        return None, content, False
-    return None, rewritten[0] if isinstance(content, str) else rewritten, True
+        verdict, replacement = _detect_content_text(detector, text)
+        if verdict is not None:
+            return verdict, None
+        replaced |= replacement is not None
+        text = text if replacement is None else replacement
+        rewritten.append(text if isinstance(part, str) else replace(part, content=text))
+    return None, rewritten if replaced else None
 
 
 _NEWLINE = r'(?:\r?\n|\\+n)'
@@ -466,12 +483,18 @@ def for_tool_result_text(
                     'A text detector used with for_tool_result_text() must replace a tool result with text.'
                 )
 
-            content_verdict, content, content_replaced = _detect_tool_return_content(detector, result.content)
+            content_verdict, content = _detect_tool_return_content(detector, result.content)
             if content_verdict is not None:
                 return content_verdict
 
-            if verdict.action == 'replace' or content_replaced:
-                return GuardrailResult.replace(replace(result, return_value=return_value, content=content))
+            if verdict.action == 'replace' or content is not None:
+                return GuardrailResult.replace(
+                    replace(
+                        result,
+                        return_value=return_value,
+                        content=result.content if content is None else content,
+                    )
+                )
             return GuardrailResult.allow()
         if on_other == 'allow':
             return GuardrailResult.allow()
