@@ -64,9 +64,9 @@ CodeModeMount = MountDir | list[MountDir]
 class CodeModeResourceLimits(TypedDict, total=False):
     """Caps on the sandbox code executed by `run_code`.
 
-    Monty enforces these per session, and a session lasts until the REPL restarts. Consecutive
-    `run_code` calls therefore share one duration budget, and a restart starts a fresh one; the
-    bound that holds throughout is that no single snippet runs longer than `max_duration_secs`.
+    Monty enforces these per session. Consecutive `run_code` calls therefore share one duration
+    allowance, and anything that resets the session starts a fresh one, so the bound that holds
+    throughout is per snippet: no single snippet runs longer than `max_duration_secs`.
     """
 
     max_duration_secs: float
@@ -368,9 +368,11 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
     resource_limits: CodeModeResourceLimits | Literal['unlimited'] | None = field(default=None, kw_only=True)
     """Sandbox execution limits, applied per Monty session.
 
-    `None` applies a 30-second execution and 256 MiB heap backstop. A session lasts until the
-    REPL restarts, so the duration budget is shared by consecutive `run_code` calls and starts
-    over on restart. `'unlimited'` removes both caps.
+    `None` applies a 30-second execution and 256 MiB heap backstop. The guarantee is per snippet:
+    no single `run_code` snippet runs longer than `max_duration_secs`. It is not a run-wide budget,
+    since consecutive calls share one session allowance and any reset of the session (`restart:
+    true`, a crash, a type error, a host-side failure) starts a fresh one. `'unlimited'` removes
+    both caps.
     """
 
     os_access: CodeModeOS | None = None

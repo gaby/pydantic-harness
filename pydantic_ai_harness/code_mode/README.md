@@ -186,14 +186,17 @@ result
 Printed output is limited to 10 MiB. Exceeding the limit makes `run_code` return a model retry.
 
 Sandbox execution is bounded by `resource_limits`, which defaults to 30 seconds of execution time
-and a 256 MiB heap. Monty applies both per sandbox session, and a session lasts from the first
-`run_code` call until the REPL restarts. Two consequences follow. Consecutive `run_code` calls draw
-down one shared duration budget rather than getting 30 seconds each, and restarting the REPL (a
-`restart: true` call, or a failure that resets the session) starts a fresh budget. What holds in
-every case is the per-snippet bound: no single snippet runs longer than `max_duration_secs` of
-sandbox time, which is what stops a runaway loop. Time spent awaiting a nested tool is excluded from
-that timer. Once a session's budget is spent, `run_code` returns a model retry reporting the timeout
-until the REPL restarts.
+and a 256 MiB heap. What this guarantees is a per-snippet ceiling: no single `run_code` snippet runs
+longer than `max_duration_secs` of sandbox time, which is what stops a runaway loop. Time spent
+awaiting a nested tool is excluded from that timer.
+
+It is not a run-wide CPU budget, and it cannot be relied on as one. Monty applies the limits per
+sandbox session, so consecutive `run_code` calls draw down one shared allowance and each new session
+starts with a full one. Sessions are replaced by `restart: true` and by the failures that reset the
+REPL: a worker crash, a type error, a host-side failure, and a syntax error before any code has run.
+Each of those renews the allowance without the model asking for a restart. An ordinary exception
+inside a snippet is not one of them, so once an allowance is spent, `run_code` keeps returning a
+model retry reporting the timeout until one of those resets happens.
 
 Nested tool calls are bounded separately by `max_tool_calls`, which defaults to 100 per `run_code`
 call. The budget is reserved before each call is scheduled, so a snippet cannot dispatch more work

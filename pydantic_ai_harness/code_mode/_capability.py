@@ -103,9 +103,11 @@ class CodeMode(AbstractCapability[AgentDepsT]):
     resource_limits: CodeModeResourceLimits | Literal['unlimited'] | None = None
     """Sandbox execution limits, applied per Monty session.
 
-    `None` applies a 30-second execution and 256 MiB heap backstop. A session lasts until the
-    REPL restarts, so the duration budget is shared by consecutive `run_code` calls and starts
-    over on restart. `'unlimited'` removes both caps.
+    `None` applies a 30-second execution and 256 MiB heap backstop. The guarantee is per snippet:
+    no single `run_code` snippet runs longer than `max_duration_secs`. It is not a run-wide budget,
+    since consecutive calls share one session allowance and any reset of the session (`restart:
+    true`, a crash, a type error, a host-side failure) starts a fresh one. `'unlimited'` removes
+    both caps.
     """
 
     dynamic_catalog: bool = False
