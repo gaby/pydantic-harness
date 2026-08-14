@@ -85,8 +85,9 @@ class Shell(AbstractCapability[AgentDepsT]):
 
     When `None` (default) the subprocess inherits the parent environment. Set
     this to a fixed mapping to start subprocesses with exactly these variables
-    and nothing else -- a hard boundary that keeps host secrets (LLM API keys,
-    tokens) out of commands the agent runs.
+    in its own environment. This is not a security boundary: a command running
+    as the same OS user may read secrets from the parent process through system
+    interfaces such as Linux procfs. Use OS-level isolation for untrusted commands.
     """
 
     denied_env_patterns: Sequence[str] = field(default_factory=list[str])
