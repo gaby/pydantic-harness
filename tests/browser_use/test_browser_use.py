@@ -8,6 +8,7 @@ import logging
 from collections.abc import Awaitable
 from dataclasses import dataclass, field, fields
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Literal, TypeVar, overload
 
 import anyio
@@ -19,6 +20,7 @@ import pytest
 from browser_use.agent.service import Agent as BrowserUseAgent
 from browser_use.agent.service import Tools  # pyright: ignore[reportPrivateImportUsage]
 from browser_use.browser import BrowserProfile, BrowserSession
+from browser_use.browser.watchdogs.security_watchdog import SecurityWatchdog
 from browser_use.llm.messages import BaseMessage
 from browser_use.llm.views import ChatInvokeCompletion
 from pydantic import BaseModel, ValidationError
@@ -204,7 +206,12 @@ class TestBrowserUseToolset:
         assert request.extend_system_message == 'Never submit forms.'
         session = request.browser_session
         assert session.browser_profile.headless is False
-        assert session.browser_profile.allowed_domains == ['example.com', 'example.org']
+        assert session.browser_profile.allowed_domains == [
+            'http*://example.com',
+            'http*://www.example.com',
+            'http*://example.org',
+            'http*://www.example.org',
+        ]
         assert session.cdp_url == 'http://localhost:9222'
         assert factory.agent.run_calls == [7]
 
@@ -229,7 +236,7 @@ class TestBrowserUseToolset:
 
         session_profile = factory.requests[0].browser_session.browser_profile
         assert session_profile.headless is False
-        assert session_profile.allowed_domains == ['docs.example.com']
+        assert session_profile.allowed_domains == ['http*://docs.example.com']
         assert session_profile.user_agent == 'harness-test'
         assert session_profile.block_ip_addresses is True
         assert session_profile.prohibited_domains == ['file://*', 'localhost', 'localhost.*', '*.localhost']
@@ -281,7 +288,7 @@ class TestBrowserUseToolset:
 
         session_profile = factory.requests[0].browser_session.browser_profile
         assert session_profile.headless is True
-        assert session_profile.allowed_domains == ['example.com']
+        assert session_profile.allowed_domains == ['http*://example.com', 'http*://www.example.com']
 
     @pytest.mark.parametrize(
         ('profile_allowed_domains', 'expected_allowed_domains'),
@@ -298,9 +305,12 @@ class TestBrowserUseToolset:
                     'http://localhost:*/*',
                     'https://*.localhost:*/*',
                 ],
-                ['trusted.example'],
+                ['http*://trusted.example', 'http*://www.trusted.example'],
             ),
-            ({'trusted.example', 'localhost'}, {'trusted.example'}),
+            (
+                {'trusted.example', 'localhost'},
+                {'http*://trusted.example', 'http*://www.trusted.example'},
+            ),
         ],
     )
     async def test_localhost_is_removed_from_a_profile_allowlist(
@@ -1066,7 +1076,10 @@ class TestSensitiveDataSafety:
         await toolset.browse_web('task')
 
         request = factory.requests[0]
-        assert request.browser_session.browser_profile.allowed_domains == ['safe.example']
+        assert request.browser_session.browser_profile.allowed_domains == [
+            'http*://safe.example',
+            'http*://www.safe.example',
+        ]
         assert request.sensitive_data == {'x_password': 'hunter2'}
 
     async def test_toolset_snapshots_profile_allowlist_with_flat_secrets(
@@ -1085,7 +1098,10 @@ class TestSensitiveDataSafety:
 
         await toolset.browse_web('task')
 
-        assert factory.requests[0].browser_session.browser_profile.allowed_domains == ['safe.example']
+        assert factory.requests[0].browser_session.browser_profile.allowed_domains == [
+            'http*://safe.example',
+            'http*://www.safe.example',
+        ]
 
     def test_empty_capability_allowlist_overrides_profile_allowlist_and_raises(self) -> None:
         with pytest.raises(ValueError, match='Flat `sensitive_data` values require'):
@@ -1275,7 +1291,7 @@ class TestAgentSpec:
             cdp_url='http://localhost:9222',
             guidance='Delegate.',
         )
-        assert capability.allowed_domains == ['example.com']
+        assert capability.allowed_domains == ['http*://example.com', 'http*://www.example.com']
         assert capability.block_ip_addresses is False
         assert capability.headless is False
         assert capability.max_steps == 10
@@ -1296,3 +1312,87 @@ class TestAgentSpec:
         spec.write_text('model: test\ncapabilities:\n  - BrowserUse:\n      max_steps: 5\n')
         agent = Agent.from_file(spec, custom_capability_types=[BrowserUse])
         assert isinstance(agent, Agent)
+
+
+class TestLocalFileNavigation:
+    """`file://` stays unreachable whatever the allowlist admits.
+
+    browser-use consults `allowed_domains` or `prohibited_domains`, never both, so
+    asserting the resolved patterns is not enough: these drive its own navigation
+    guard, which is what actually decides a URL.
+    """
+
+    @staticmethod
+    def _navigation_allowed(profile: BrowserProfile, url: str) -> bool:
+        watchdog = SecurityWatchdog.__new__(SecurityWatchdog)
+        session = SimpleNamespace(browser_profile=profile, logger=logging.getLogger('test'))
+        object.__setattr__(watchdog, 'browser_session', session)
+        return watchdog._is_url_allowed(url)  # pyright: ignore[reportPrivateUsage]
+
+    @staticmethod
+    async def _resolved_profile(allowed_domains: list[str] | None, block_ip_addresses: bool) -> BrowserProfile:
+        factory = _success_factory()
+        await (
+            BrowserUse[None](
+                allowed_domains=allowed_domains,
+                block_ip_addresses=block_ip_addresses,
+                browser_agent=factory,
+            )
+            .get_toolset()
+            .browse_web('task')
+        )
+        return factory.requests[0].browser_session.browser_profile
+
+    @pytest.mark.parametrize(
+        ('allowed_domains', 'block_ip_addresses'),
+        [
+            (None, True),
+            (['*'], False),
+            (['example.com'], True),
+            (['*.example.com'], True),
+            (['localhost'], False),
+            (['*://localhost:*/*'], False),
+            (['local*'], False),
+        ],
+    )
+    @pytest.mark.parametrize(
+        'url',
+        [
+            'file://localhost/etc/passwd',
+            'file://LOCALHOST/etc/passwd',
+            'file:///etc/passwd',
+            'file:/etc/passwd',
+            'FILE:///etc/passwd',
+            'file:///C:/Windows/win.ini',
+        ],
+    )
+    async def test_file_urls_are_unreachable(
+        self, allowed_domains: list[str] | None, block_ip_addresses: bool, url: str
+    ) -> None:
+        profile = await self._resolved_profile(allowed_domains, block_ip_addresses)
+        assert self._navigation_allowed(profile, url) is False
+
+    @pytest.mark.parametrize(
+        ('allowed_domains', 'block_ip_addresses', 'url'),
+        [
+            (['*'], False, 'https://example.com/'),
+            (['example.com'], True, 'https://example.com/'),
+            (['example.com'], True, 'https://www.example.com/'),
+            (['*.example.com'], True, 'https://api.example.com/'),
+            (['localhost'], False, 'http://localhost:3000/'),
+            (['*://localhost:*/*'], False, 'http://localhost:3000/'),
+        ],
+    )
+    async def test_http_navigation_survives_the_file_restriction(
+        self, allowed_domains: list[str], block_ip_addresses: bool, url: str
+    ) -> None:
+        profile = await self._resolved_profile(allowed_domains, block_ip_addresses)
+        assert self._navigation_allowed(profile, url) is True
+
+    def test_an_allowlist_of_only_file_urls_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match='permits only `file://` URLs'):
+            BrowserUse[None](allowed_domains=['file://*'])
+
+    def test_a_profile_allowlist_of_only_file_urls_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match='permits only `file://` URLs'):
+            BrowserUse[None](browser_profile=BrowserProfile(allowed_domains=['file://*']))

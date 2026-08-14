@@ -198,7 +198,9 @@ origin.
   `'*.example.com'` work for navigation, but not with flat `sensitive_data`.
   A bare scheme-qualified host such as
   `'https://example.com'` is given a path boundary before browser-use matches
-  it, so it does not match `https://example.com.attacker.test`.
+  it, so it does not match `https://example.com.attacker.test`. A host-only
+  entry (`'example.com'`, `'localhost'`, `'*'`) is qualified to `http`/`https`
+  first, so an allowlist cannot re-admit `file://` (see **File actions**).
 - **Private networks.** `block_ip_addresses=True` by default blocks direct IP
   addresses and common localhost hostnames, including when a profile has an
   allowlist. Set it to `False` only when a task must reach an internal service.
@@ -209,7 +211,11 @@ origin.
   inside it. Non-empty custom `guidance` retains this rule automatically;
   `guidance=''` is the explicit opt-out.
 - **File actions.** The default factory disables browser-use's `read_file` and
-  `upload_file` actions and prohibits `file://` navigation. Downloaded PDFs stay
+  `upload_file` actions and prohibits `file://` navigation. browser-use consults
+  `allowed_domains` or `prohibited_domains`, never both, so a permissive
+  allowlist entry would otherwise override that prohibition; host-only entries
+  are qualified to `http`/`https` to close that path, and an allowlist
+  permitting only `file://` URLs is rejected. Downloaded PDFs stay
   out of browser-use's PDF parser, and uploads need an application-specific
   approval or destination policy. A custom factory that re-enables either
   action needs to provide those controls.

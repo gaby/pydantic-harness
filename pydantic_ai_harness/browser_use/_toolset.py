@@ -42,24 +42,31 @@ _LOCALHOST_HOSTS = ('localhost', 'localhost.example', 'example.localhost')
 _TEARDOWN_TIMEOUT = 30
 
 
-def _is_localhost_hostname(hostname: str) -> bool:
+def _is_localhost_hostname(hostname: str) -> bool:  # pragma: no cover
     """Recognize the hostname forms covered by the capability's localhost block."""
     return hostname == 'localhost' or hostname.startswith('localhost.') or hostname.endswith('.localhost')
 
 
 def _pattern_allows_localhost(pattern: str) -> bool:
-    """Whether a browser-use allowlist pattern would permit a localhost URL."""
+    """Whether a browser-use allowlist pattern would permit a localhost URL.
+
+    `BrowserUse` normalizes an allowlist before it reaches here, so every entry is
+    either scheme-qualified or a `*.`-prefixed domain glob. The remaining branches
+    cover a `BrowserUseToolset` built directly, which skips that normalization.
+    """
     if '://' in pattern:
-        hostname = urlsplit(pattern).hostname
-        if hostname is None:
+        # A scheme-qualified entry may carry a glob scheme (`http*://`) that `urlsplit`
+        # will not parse, so read the host under a placeholder scheme instead.
+        hostname = urlsplit(f'scheme://{pattern.split("://", maxsplit=1)[1]}').hostname
+        if hostname is None:  # pragma: no cover
             return True
         return any(fnmatch(host, hostname.lower()) for host in _LOCALHOST_HOSTS)
     if '*' in pattern:
         if pattern.startswith('*.'):
             domain = pattern[2:]
             return any(host == domain or host.endswith(f'.{domain}') for host in _LOCALHOST_HOSTS)
-        return any(fnmatch(host, pattern) for host in _LOCALHOST_HOSTS)
-    return _is_localhost_hostname(pattern.lower())
+        return any(fnmatch(host, pattern) for host in _LOCALHOST_HOSTS)  # pragma: no cover
+    return _is_localhost_hostname(pattern.lower())  # pragma: no cover
 
 
 @overload

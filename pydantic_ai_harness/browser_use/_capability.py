@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from fnmatch import fnmatch
 from typing import TYPE_CHECKING, Literal
 from urllib.parse import urlsplit
 
@@ -44,19 +45,65 @@ _INSTRUCTIONS = (
 )
 
 
-def _normalize_allowed_domain(domain: str) -> str:
-    """Make a scheme-qualified host entry safe for browser-use's URL matching."""
-    parsed = urlsplit(domain)
-    if (
-        parsed.scheme in ('http', 'https')
-        and parsed.netloc
-        and not parsed.path
-        and not parsed.query
-        and not parsed.fragment
-        and '*' not in domain
-    ):
-        return f'{domain}/*'
-    return domain
+_HTTP_SCHEME_GLOB = 'http*'
+
+_FILE_SCHEME_ALLOWLIST_ERROR = (
+    'An `allowed_domains` entry that permits only `file://` URLs is not supported; '
+    'local file navigation is always prohibited.'
+)
+
+
+def _restrict_to_http_schemes(domain: str) -> list[str]:
+    """Scheme-qualify a host-only allowlist entry so it cannot admit a `file://` URL."""
+    restricted = [f'{_HTTP_SCHEME_GLOB}://{domain}']
+    if '*' not in domain and domain.count('.') == 1:
+        restricted.append(f'{_HTTP_SCHEME_GLOB}://www.{domain}')
+    return restricted
+
+
+def _normalize_allowed_domain(domain: str) -> list[str]:
+    """Make an allowlist entry safe for browser-use's URL matching.
+
+    browser-use consults `allowed_domains` or `prohibited_domains`, never both:
+    a non-empty allowlist short-circuits the prohibition list entirely. A host-only
+    entry matches on hostname regardless of scheme, so it would admit
+    `file://<host>/...` and override the local-file prohibition. Qualifying such an
+    entry to `http`/`https` keeps the caller's intent (including a local dev server
+    on `http://localhost`) while leaving the file scheme unreachable.
+
+    Entries already scoped to a scheme are left alone unless that scheme admits `file`:
+    a wildcard scheme is narrowed to `http`/`https`, and an entry naming `file` alone is
+    dropped. browser-use restricts bare `*.example.com` patterns to `http`/`https`
+    itself, so those need no qualification.
+    """
+    if '://' in domain:
+        scheme, rest = domain.split('://', maxsplit=1)
+        if fnmatch('file', scheme.lower()):
+            if fnmatch('http', scheme.lower()) or fnmatch('https', scheme.lower()):
+                return [f'{_HTTP_SCHEME_GLOB}://{rest}']
+            return []
+        parsed = urlsplit(domain)
+        if (
+            parsed.scheme in ('http', 'https')
+            and parsed.netloc
+            and not parsed.path
+            and not parsed.query
+            and not parsed.fragment
+            and '*' not in domain
+        ):
+            return [f'{domain}/*']
+        return [domain]
+    if domain.startswith('*.'):
+        return [domain]
+    return _restrict_to_http_schemes(domain)
+
+
+def _normalize_allowed_domains(allowed_domains: list[str]) -> list[str]:
+    """Normalize a capability-level allowlist, rejecting one that permits only `file://`."""
+    normalized = [entry for domain in allowed_domains for entry in _normalize_allowed_domain(domain)]
+    if allowed_domains and not normalized:
+        raise ValueError(_FILE_SCHEME_ALLOWLIST_ERROR)
+    return normalized
 
 
 def _normalize_profile_allowed_domains(
@@ -65,7 +112,9 @@ def _normalize_profile_allowed_domains(
     """Normalize a browser profile's allowed domains without losing set semantics."""
     if allowed_domains is None:
         return None
-    normalized: list[str] = [_normalize_allowed_domain(domain) for domain in allowed_domains]
+    normalized: list[str] = [entry for domain in allowed_domains for entry in _normalize_allowed_domain(domain)]
+    if allowed_domains and not normalized:
+        raise ValueError(_FILE_SCHEME_ALLOWLIST_ERROR)
     return set(normalized) if isinstance(allowed_domains, set) else normalized
 
 
@@ -269,17 +318,17 @@ class BrowserUse(AbstractCapability[AgentDepsT]):
 
     def _validate_sensitive_data(self) -> None:
         """Validate the mutable secret configuration before creating its toolset."""
-        effective_allowed_domains = self.allowed_domains
-        if effective_allowed_domains is not None:
-            self.allowed_domains = [_normalize_allowed_domain(domain) for domain in effective_allowed_domains]
-            effective_allowed_domains = self.allowed_domains
-        elif self.browser_profile is not None:
+        if self.allowed_domains is not None:
+            self.allowed_domains = _normalize_allowed_domains(self.allowed_domains)
+        if self.browser_profile is not None:
             normalized_allowed_domains = _normalize_profile_allowed_domains(self.browser_profile.allowed_domains)
             if normalized_allowed_domains != self.browser_profile.allowed_domains:
                 self.browser_profile = self.browser_profile.model_copy(
                     update={'allowed_domains': normalized_allowed_domains}
                 )
-            effective_allowed_domains = normalized_allowed_domains
+        effective_allowed_domains = self.allowed_domains
+        if effective_allowed_domains is None and self.browser_profile is not None:
+            effective_allowed_domains = self.browser_profile.allowed_domains
         has_restrictive_allowlist = bool(effective_allowed_domains) and not any(
             _has_wildcard_hostname(domain) for domain in effective_allowed_domains
         )
