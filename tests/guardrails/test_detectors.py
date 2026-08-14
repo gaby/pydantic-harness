@@ -8,8 +8,10 @@ import pytest
 from pydantic_ai import Agent
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.messages import (
+    BinaryContent,
     ModelMessage,
     ModelResponse,
+    TextContent,
     TextPart,
     ToolCallPart,
     ToolReturn,
@@ -502,10 +504,44 @@ class TestForToolResultText:
 
         assert verdict == GuardrailResult.replace('key: [redacted:openai_key]')
 
-    def test_an_unmodified_tool_return_is_allowed(self):
-        verdict = for_tool_result_text(redact_secrets)(self._info(ToolReturn('no secret')))
+    @pytest.mark.parametrize('content', [None, 'safe context'])
+    def test_an_unmodified_tool_return_is_allowed(self, content: str | None):
+        verdict = for_tool_result_text(redact_secrets)(self._info(ToolReturn('no secret', content=content)))
 
         assert verdict == GuardrailResult.allow()
+
+    def test_tool_return_content_reaches_the_detector(self):
+        image = BinaryContent(data=b'image', media_type='image/png')
+        result = ToolReturn(
+            'safe summary', content=[f'key: {_OPENAI_KEY}', TextContent(content=f'context: {_OPENAI_KEY}'), image]
+        )
+
+        verdict = for_tool_result_text(redact_secrets)(self._info(result))
+
+        assert verdict == GuardrailResult.replace(
+            ToolReturn(
+                'safe summary',
+                content=[
+                    'key: [redacted:openai_key]',
+                    TextContent(content='context: [redacted:openai_key]'),
+                    image,
+                ],
+            )
+        )
+
+    def test_a_content_detector_verdict_is_preserved(self):
+        verdict = for_tool_result_text(blocked_keywords(['blocked']))(
+            self._info(ToolReturn('safe summary', content='blocked context'))
+        )
+
+        assert verdict.action == 'block'
+
+    def test_a_content_detector_must_replace_with_text(self):
+        def invalid_detector(text: str) -> GuardrailResult:
+            return GuardrailResult.replace(42) if text == 'secret' else GuardrailResult.allow()
+
+        with pytest.raises(UserError, match='replace tool content with text'):
+            for_tool_result_text(invalid_detector)(self._info(ToolReturn('safe', content=['secret'])))
 
     @pytest.mark.parametrize('result', ['secret', ToolReturn('secret')])
     def test_a_text_detector_must_replace_with_text(self, result: object):
@@ -531,7 +567,7 @@ class TestForToolResultText:
 
         @agent.tool_plain
         def lookup() -> ToolReturn:
-            return ToolReturn(f'key: {_OPENAI_KEY}', content='keep this context', metadata=metadata)
+            return ToolReturn(f'key: {_OPENAI_KEY}', content=f'context: {_OPENAI_KEY}', metadata=metadata)
 
         result = await agent.run('hi')
         returns = [
@@ -541,7 +577,8 @@ class TestForToolResultText:
         assert [(part.content, part.metadata) for part in returns] == [
             ('key: [redacted:openai_key]', metadata),
         ]
-        assert 'keep this context' in str(result.all_messages())
+        assert f'context: {_OPENAI_KEY}' not in str(result.all_messages())
+        assert 'context: [redacted:openai_key]' in str(result.all_messages())
 
     async def test_a_non_text_tool_result_must_be_allowed_explicitly(self):
         def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:

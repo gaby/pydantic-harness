@@ -44,12 +44,12 @@ not as the answer.
 from __future__ import annotations
 
 import re
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import replace
 from typing import Literal, TypeGuard
 
 from pydantic_ai.exceptions import UserError
-from pydantic_ai.messages import ToolReturn
+from pydantic_ai.messages import TextContent, ToolReturn, UserContent
 
 from pydantic_ai_harness.guardrails._shared import GuardrailResult
 from pydantic_ai_harness.guardrails._tool_guardrail import ToolResultInfo
@@ -61,6 +61,33 @@ TextDetector = Callable[[str], GuardrailResult]
 def _is_text_tool_return(value: object) -> TypeGuard[ToolReturn[str]]:
     """Whether `value` is a `ToolReturn` with a string payload."""
     return isinstance(value, ToolReturn) and isinstance(value.return_value, str)
+
+
+def _detect_tool_return_content(
+    detector: TextDetector, content: str | Sequence[UserContent] | None
+) -> tuple[GuardrailResult | None, str | Sequence[UserContent] | None, bool]:
+    """Run a detector over each text-bearing part of `ToolReturn.content`."""
+    if content is None:
+        return None, content, False
+    parts: Sequence[UserContent] = [content] if isinstance(content, str) else content
+    rewritten: list[UserContent] = []
+    replaced = False
+    for part in parts:
+        text = part if isinstance(part, str) else part.content if isinstance(part, TextContent) else None
+        if text is None:
+            rewritten.append(part)
+            continue
+        verdict = detector(text)
+        if verdict.action not in ('allow', 'replace'):
+            return verdict, content, False
+        replacement = verdict.replacement if verdict.action == 'replace' else text
+        if not isinstance(replacement, str):
+            raise UserError('A text detector used with for_tool_result_text() must replace tool content with text.')
+        rewritten.append(replacement if isinstance(part, str) else replace(part, content=replacement))
+        replaced |= verdict.action == 'replace'
+    if not replaced:
+        return None, content, False
+    return None, rewritten[0] if isinstance(content, str) else rewritten, True
 
 
 _NEWLINE = r'(?:\r?\n|\\+n)'
@@ -410,10 +437,10 @@ def for_tool_result_text(
 ) -> Callable[[ToolResultInfo], GuardrailResult]:
     """Adapt a text detector to the result object `ToolGuardrail` supplies.
 
-    Plain string results are passed to `detector`. A `ToolReturn` with a string
-    `return_value` is rebuilt when the detector redacts it, retaining its
-    `content`, `metadata`, and `kind`. `ToolReturn.content` is a separate
-    model-directed user-content channel and is not inspected here.
+    Plain string results are passed to `detector`. For a `ToolReturn` with a
+    string `return_value`, the detector also checks the text in its
+    model-directed `content`. The `ToolReturn` is rebuilt when either channel is
+    redacted, retaining its `metadata`, `kind`, and non-text content.
 
     A non-text result has no safe text replacement. The default raises with the
     adapter name; `on_other='allow'` deliberately skips it.
@@ -431,14 +458,21 @@ def for_tool_result_text(
         if _is_text_tool_return(result):
             assert isinstance(result.return_value, str)
             verdict = detector(result.return_value)
-            if verdict.action != 'replace':
+            if verdict.action not in ('allow', 'replace'):
                 return verdict
-            replacement = verdict.replacement
-            if not isinstance(replacement, str):
+            return_value = verdict.replacement if verdict.action == 'replace' else result.return_value
+            if not isinstance(return_value, str):
                 raise UserError(
                     'A text detector used with for_tool_result_text() must replace a tool result with text.'
                 )
-            return GuardrailResult.replace(replace(result, return_value=replacement))
+
+            content_verdict, content, content_replaced = _detect_tool_return_content(detector, result.content)
+            if content_verdict is not None:
+                return content_verdict
+
+            if verdict.action == 'replace' or content_replaced:
+                return GuardrailResult.replace(replace(result, return_value=return_value, content=content))
+            return GuardrailResult.allow()
         if on_other == 'allow':
             return GuardrailResult.allow()
         raise UserError(

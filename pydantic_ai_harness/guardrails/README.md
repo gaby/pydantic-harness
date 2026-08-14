@@ -144,8 +144,8 @@ OutputGuardrail(guard=for_text(redact_secrets, on_other='allow'))  # skips it de
 ```
 
 A tool result guard receives `ToolResultInfo`, not just a value. Use
-`for_tool_result_text` to adapt a detector for a bare string result or a
-`ToolReturn.return_value` string:
+`for_tool_result_text` to adapt a detector for a bare string result or the text
+channels of a `ToolReturn`:
 
 ```python
 from pydantic_ai_harness.guardrails import ToolGuardrail
@@ -154,11 +154,11 @@ from pydantic_ai_harness.guardrails.detectors import for_tool_result_text, redac
 ToolGuardrail(result_guard=for_tool_result_text(redact_secrets))
 ```
 
-When it redacts a `ToolReturn`, the adapter replaces `return_value` and
-preserves its `content`, `metadata`, and `kind`. `ToolReturn.content` is sent
-as a separate user-prompt part, so the adapter does not inspect it. As with
-`for_text`, a non-text result raises by default; pass `on_other='allow'` to
-skip one deliberately.
+The adapter checks a string `return_value` and all text in `content`, which core
+sends as a separate user-prompt part. When it redacts either channel, it
+preserves the `ToolReturn` metadata, kind, and non-text content. As with
+`for_text`, a non-text result raises by default; pass `on_other='allow'` to skip
+one deliberately.
 
 A detector on the input side needs a text prompt. A multimodal prompt reaches
 the guard rendered as text, so a detector that matches one returns `replace`,
