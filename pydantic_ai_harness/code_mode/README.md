@@ -201,8 +201,10 @@ Once a session's allowance is spent, every later `run_code` call fails on arriva
 snippets that would cost almost nothing, because they reuse the same session. Rewriting the code
 does not help. `restart: true` is what recovers it, at the cost of the REPL state that session was
 holding, so any variables, imports, and definitions have to be recreated. `run_code` says as much
-in the retry it returns, but the behaviour is worth knowing when choosing `max_duration_secs`: set
-it low and a long agent run will spend it on ordinary work and pay a restart to continue.
+in the retry it returns, and that retry also reports the nested calls the snippet already made, so
+restarting does not throw away the only record of them. The behaviour is worth knowing when
+choosing `max_duration_secs`: set it low and a long agent run will spend it on ordinary work and
+pay a restart to continue.
 
 Nested tool calls are bounded separately by `max_tool_calls`, which defaults to 100 per `run_code`
 call. The budget is reserved before each call is scheduled, so a snippet cannot dispatch more work

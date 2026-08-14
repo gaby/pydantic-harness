@@ -72,17 +72,27 @@ _RETRY_SUMMARY_MAX_CHARS = 2000
 def _is_duration_exhausted(error: MontyRuntimeError) -> bool:
     """Whether this runtime error is Monty's spent `max_duration_secs` allowance.
 
-    Monty reports it as a `TimeoutError` carried inside `MontyRuntimeError`, with no typed marker
-    or attribute to test, so its rendered text is the only signal available
-    (`'TimeoutError: time limit exceeded: 300.000045ms > 300ms'`). Matching another package's
-    wording is brittle, so it is confined to this function: a Monty reword is one edit here, and
-    `test_duration_exhaustion_points_at_restart` drives a real exhausted session rather than a
-    fixed string, so a reword fails that test instead of silently dropping the hint.
+    Two signals, because neither alone is sound. The empty traceback is the structural one: the
+    duration limit interrupts execution rather than failing at a particular operation, and Monty
+    attaches no frame to it, measured at top level and three calls deep alike. Failures that do
+    happen at a sandbox site carry at least the module frame, including an exception a nested tool
+    raised that Monty re-raised at the call site, which keeps the tool's own message. Text alone
+    would therefore misread a tool that failed with `'time limit exceeded'` in its message and
+    tell the model to discard REPL state the session is still able to use.
+
+    The message check then separates this from other limits. Exceeding `max_memory` reports
+    `'memory limit exceeded'` and carries a frame from the allocation that tripped it, so either
+    signal excludes it; keeping both means neither has to be sound alone. Monty exposes no typed
+    marker for either limit, so its wording is load-bearing here and nowhere else, and a reword is
+    one edit in this function. `test_duration_exhaustion_points_at_restart` drives a real
+    exhausted session rather than a fixed string, so a reword fails that test instead of quietly
+    dropping the hint, and `test_tool_error_resembling_a_timeout_is_not_treated_as_exhaustion`
+    pins the false-positive side.
 
     Callers must read `False` as "add nothing", not as "not a timeout". A miss leaves the ordinary
     runtime-error message intact, which is the behaviour that shipped before the hint existed.
     """
-    return 'time limit exceeded' in error.display(format='type-msg')
+    return not error.traceback() and 'time limit exceeded' in error.display(format='msg')
 
 
 def _preview(value: object) -> str:
@@ -798,12 +808,14 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
             # (ModelRetry → MontyRuntimeError → ModelRetry), but the retry
             # semantics are the same -- the model gets another chance.
             message = f'Runtime error:\n{capture.prepend_to(e.display())}'
-            if budget_exhausted and nested_calls:
+            duration_spent = _is_duration_exhausted(e)
+            if nested_calls and (budget_exhausted or duration_spent):
                 # A retry is the only record the model gets of an uncaught failure, and these
                 # calls already started. Without them the model reruns their side effects when
-                # it retries with a smaller batch.
+                # it retries. That matters most on the duration path, where the advice is to
+                # restart, which discards the REPL state it would otherwise reconstruct from.
                 message += f'\n\n{_describe_started_calls(nested_calls, nested_returns)}'
-            elif _is_duration_exhausted(e):
+            if duration_spent:
                 # This error keeps the session, so every later call fails on arrival too. Left
                 # alone it reads like an ordinary runtime error, which points the model at
                 # rewriting the snippet -- the one move that cannot work.

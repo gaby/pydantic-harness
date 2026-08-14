@@ -657,6 +657,61 @@ class TestCodeMode:
         result = await wrapper.call_tool('run_code', {'code': '1 + 1', 'restart': True}, ctx, tools['run_code'])
         assert result.return_value == 2
 
+    async def test_tool_error_resembling_a_timeout_is_not_treated_as_exhaustion(self) -> None:
+        """A nested tool failing with the sandbox's timeout wording must not trigger the hint.
+
+        Monty re-raises a tool's exception at the sandbox call site keeping its message, so text
+        alone cannot tell the two apart. A false positive is worse than a miss here: it tells the
+        model to restart, discarding REPL state the session is still perfectly able to use.
+        """
+
+        def boom() -> str:
+            """Fail with wording that matches the sandbox's own timeout."""
+            raise ValueError('time limit exceeded: 999s > 1s')
+
+        wrapper = CodeMode[object]().get_wrapper_toolset(_build_function_toolset(boom))
+        assert isinstance(wrapper, CodeModeToolset)
+        ctx = await build_ctx(None, wrapper)
+        tools = await wrapper.get_tools(ctx)
+
+        seeded = await wrapper.call_tool('run_code', {'code': 'saved = 42\nsaved'}, ctx, tools['run_code'])
+        assert seeded.return_value == 42
+
+        with pytest.raises(ModelRetry) as exc_info:
+            await wrapper.call_tool('run_code', {'code': 'await boom()'}, ctx, tools['run_code'])
+        assert 'time limit exceeded' in exc_info.value.message
+        assert 'restart' not in exc_info.value.message
+
+        # The session was never exhausted, so its REPL state is still there to use.
+        kept = await wrapper.call_tool('run_code', {'code': 'saved'}, ctx, tools['run_code'])
+        assert kept.return_value == 42
+
+    async def test_duration_exhaustion_reports_calls_already_made(self) -> None:
+        """Restarting discards REPL state, so the retry has to say what already ran.
+
+        Otherwise the advice is to throw away the only record of the work while giving the model
+        nothing to reconstruct it from.
+        """
+        wrapper = CodeMode[object](resource_limits={'max_duration_secs': 0.3}).get_wrapper_toolset(
+            _build_function_toolset(add)
+        )
+        assert isinstance(wrapper, CodeModeToolset)
+        ctx = await build_ctx(None, wrapper)
+        tools = await wrapper.get_tools(ctx)
+
+        with pytest.raises(ModelRetry) as exc_info:
+            await wrapper.call_tool(
+                'run_code',
+                {'code': ('r = await add(a=1, b=2)\ny = 0\nfor i in range(100_000_000):\n    y += i\ny')},
+                ctx,
+                tools['run_code'],
+            )
+
+        message = exc_info.value.message
+        assert '`restart: true`' in message
+        assert '1 nested tool calls started' in message
+        assert "add({'a': 1, 'b': 2}) returned 3" in message
+
     async def test_ordinary_runtime_error_does_not_mention_restart(self) -> None:
         """A plain exception keeps the message it always had; the hint is not bolted onto everything."""
         wrapper = CodeMode[object]().get_wrapper_toolset(_build_function_toolset(add))
