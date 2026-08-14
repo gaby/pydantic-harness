@@ -602,6 +602,25 @@ class TestSearchFiles:
         finally:
             target.unlink(missing_ok=True)
 
+    async def test_search_matches_in_root_symlink_under_its_own_name(
+        self, toolset: FileSystemToolset[None], fs_root: Path
+    ) -> None:
+        # An in-root symlink is authorized via its canonical target but is
+        # filtered and reported under the name the walk discovered.
+        (fs_root / 'shared.txt').write_text('needle here\n')
+        (fs_root / 'module.py').symlink_to(fs_root / 'shared.txt')
+        result = await toolset.search_files('needle', include_glob='*.py')
+        assert result == 'module.py:1:needle here'
+
+    async def test_search_skips_circular_symlinks(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
+        # `Path.resolve` reports a symlink loop as `RuntimeError` on Python
+        # <= 3.12; the loop entry is skipped instead of aborting the search.
+        (fs_root / 'real.txt').write_text('needle here\n')
+        (fs_root / 'loop').symlink_to(fs_root / 'loop2')
+        (fs_root / 'loop2').symlink_to(fs_root / 'loop')
+        result = await toolset.search_files('needle here')
+        assert result == 'real.txt:1:needle here'
+
 
 class TestFindFiles:
     async def test_find_glob(self, toolset: FileSystemToolset[None]) -> None:

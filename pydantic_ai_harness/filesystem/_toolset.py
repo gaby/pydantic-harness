@@ -382,20 +382,24 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
 
         for file_path in files:
             try:
-                discovered_rel = str(file_path.relative_to(self._real_root))
-                file_path = self._safe_resolve(discovered_rel, write=True)
-            except (PermissionError, ValueError):
+                rel_str = str(file_path.relative_to(self._real_root))
+                # Authorize the canonical target so a symlink can't be used to
+                # read a file the agent couldn't open directly. `RuntimeError`
+                # covers `Path.resolve` reporting a symlink loop on Python
+                # <= 3.12; treat it as one more unreadable entry to skip.
+                real_path = self._safe_resolve(rel_str, write=True)
+            except (PermissionError, ValueError, RuntimeError):
                 continue
-            if not file_path.is_file():
+            if not real_path.is_file():
                 continue
-            rel_parts = file_path.relative_to(self._real_root).parts
-            if any(part.startswith('.') for part in rel_parts):
+            # Filtering and reporting stay on the discovered path so an in-root
+            # symlink is still matched and reported under its own name.
+            if any(part.startswith('.') for part in Path(rel_str).parts):
                 continue
-            rel_str = str(file_path.relative_to(self._real_root))
             if include_glob and not fnmatch.fnmatch(rel_str, include_glob):
                 continue
             try:
-                raw = file_path.read_bytes()
+                raw = real_path.read_bytes()
             except OSError:  # pragma: no cover
                 continue
             if _is_binary(raw):
