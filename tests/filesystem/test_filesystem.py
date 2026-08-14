@@ -592,6 +592,96 @@ class TestSearchFiles:
         assert 'keep.py' in result
         assert 'skip.md' not in result
 
+    async def test_search_skips_denied_name_pointing_at_an_allowed_target(self, fs_root: Path) -> None:
+        # Policy applies to the discovered name too, so a denied name can't be
+        # laundered by pointing it at a file that passes on its own.
+        (fs_root / 'target.txt').write_text('findme\n')
+        (fs_root / 'blocked.secret').symlink_to(fs_root / 'target.txt')
+        ts = FileSystemToolset(
+            root_dir=fs_root,
+            allowed_patterns=[],
+            denied_patterns=['*.secret'],
+            protected_patterns=[],
+            max_read_lines=2000,
+            max_search_results=1000,
+            max_find_results=1000,
+        )
+        result = await ts.search_files('findme')
+        assert result == 'target.txt:1:findme'
+
+    async def test_search_skips_unallowed_name_pointing_at_an_allowed_target(self, fs_root: Path) -> None:
+        # The mirror case: the target matches allowed_patterns but the name the
+        # walk discovered does not, so the name stays out of the results.
+        (fs_root / 'target.py').write_text('findme\n')
+        (fs_root / 'alias.md').symlink_to(fs_root / 'target.py')
+        ts = FileSystemToolset(
+            root_dir=fs_root,
+            allowed_patterns=['*.py'],
+            denied_patterns=[],
+            protected_patterns=[],
+            max_read_lines=2000,
+            max_search_results=1000,
+            max_find_results=1000,
+        )
+        result = await ts.search_files('findme')
+        assert result == 'target.py:1:findme'
+
+    async def test_search_skips_symlinks_outside_root(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
+        target = fs_root.parent / 'search-symlink-target.txt'
+        target.write_text('outside secret\n')
+        try:
+            (fs_root / 'outside-link.txt').symlink_to(target)
+            result = await toolset.search_files('outside secret')
+            assert result == 'No matches found.'
+        finally:
+            target.unlink(missing_ok=True)
+
+    async def test_search_matches_in_root_symlink_under_its_own_name(
+        self, toolset: FileSystemToolset[None], fs_root: Path
+    ) -> None:
+        # An in-root symlink is authorized via its canonical target but is
+        # filtered and reported under the name the walk discovered.
+        (fs_root / 'shared.txt').write_text('needle here\n')
+        (fs_root / 'module.py').symlink_to(fs_root / 'shared.txt')
+        result = await toolset.search_files('needle', include_glob='*.py')
+        assert result == 'module.py:1:needle here'
+
+    async def test_search_skips_symlink_cycles(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
+        # A cycle in the tree is skipped, not raised, on every supported Python.
+        # Each entry is resolved before the `is_file` guard, so on 3.10-3.12 the
+        # cycle reaches `resolve` and this exercises the handler for real;
+        # from 3.13 on, non-strict `resolve` returns the cycle path unchanged
+        # and `is_file` filters it instead.
+        (fs_root / 'real.txt').write_text('cycle needle\n')
+        (fs_root / 'loop').symlink_to(fs_root / 'loop2')
+        (fs_root / 'loop2').symlink_to(fs_root / 'loop')
+
+        result = await toolset.search_files('cycle needle')
+
+        assert result == 'real.txt:1:cycle needle'
+
+    async def test_search_skips_entry_whose_resolve_raises(
+        self, toolset: FileSystemToolset[None], fs_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # `resolve` only raises for a cycle on 3.10-3.12, so patch it to fail the
+        # way a cycle would and pin the handler on every version. `RuntimeError`
+        # is the one that matters: `_recoverable` does not convert it, so an
+        # unhandled one aborts the run instead of returning the other matches.
+        (fs_root / 'real.txt').write_text('swap needle\n')
+        (fs_root / 'swapped.txt').write_text('swap needle\n')
+        unpatched = Path.resolve
+
+        def failing_resolve(self: Path, strict: bool = False) -> Path:
+            if self.name == 'swapped.txt':
+                raise RuntimeError(f'Symlink loop from {str(self)!r}')
+            return unpatched(self, strict=strict)
+
+        monkeypatch.setattr(Path, 'resolve', failing_resolve)
+
+        result = await toolset.search_files('swap needle')
+
+        assert result == 'real.txt:1:swap needle'
+
 
 class TestFindFiles:
     async def test_find_glob(self, toolset: FileSystemToolset[None]) -> None:

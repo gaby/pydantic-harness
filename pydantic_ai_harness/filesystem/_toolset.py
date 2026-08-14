@@ -78,7 +78,8 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
 
     Security model:
     - All paths resolved relative to root with canonical path checks
-    - Symlinks resolved before authorization (prevents TOCTTOU)
+    - Symlinks resolved before authorization, so one pointing outside the root at
+      resolve time is rejected rather than followed
     - Glob-based allow/deny filtering
     - Protected path patterns (e.g. `.git/`, `.env`)
     - Binary file detection blocks text operations
@@ -380,26 +381,35 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         else:
             files = sorted(resolved.rglob('*'))
 
-        real_root = Path(os.path.realpath(self._root))
         for file_path in files:
-            if not file_path.is_file():
-                continue
             try:
-                rel_parts = file_path.relative_to(real_root).parts
-            except ValueError:  # pragma: no cover
+                rel_str = str(file_path.relative_to(self._real_root))
+                # Authorize the canonical target so a symlink can't be used to
+                # read a file the agent couldn't open directly.
+                real_path = self._safe_resolve(rel_str, write=True)
+            # One unreadable entry skips rather than ending the walk. A denied or
+            # escaping path arrives as `PermissionError` (an `OSError`); a symlink
+            # cycle as `RuntimeError` on 3.10-3.12 and as `OSError` from 3.13 on,
+            # where pathlib moved onto `os.path.realpath`. `_recoverable` converts
+            # neither, so an unhandled one would abort the run.
+            except (OSError, ValueError, RuntimeError):
                 continue
-            if any(part.startswith('.') for part in rel_parts):
-                continue
-            rel_str = str(file_path.relative_to(real_root))
-            # Apply the same allow/deny/protected filtering used for direct
-            # access so a recursive search can't read patterns the agent
-            # couldn't otherwise read.
+            # Both sides have to pass. `_safe_resolve` covers the canonical
+            # target, so an allowed name can't reach a denied file; this covers
+            # the discovered name, so a denied name can't be laundered through
+            # an allowed target.
             if not self._is_accessible(rel_str, write=True):
+                continue
+            if not real_path.is_file():
+                continue
+            # Filtering and reporting stay on the discovered path so an in-root
+            # symlink is still matched and reported under its own name.
+            if any(part.startswith('.') for part in Path(rel_str).parts):
                 continue
             if include_glob and not fnmatch.fnmatch(rel_str, include_glob):
                 continue
             try:
-                raw = file_path.read_bytes()
+                raw = real_path.read_bytes()
             except OSError:  # pragma: no cover
                 continue
             if _is_binary(raw):
