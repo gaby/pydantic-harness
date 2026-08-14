@@ -879,6 +879,43 @@ class TestCodeMode:
             await wrapper.__aenter__()
         await wrapper.__aexit__(None, None, None)
 
+    async def test_workflow_duration_report_is_once_per_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Pins how often the report actually reaches a caller across two runs of one agent.
+
+        `for_run` clones with `replace`, which reinitializes the flag, so the report is once per
+        run rather than once per capability. Under Python's default filter that difference is
+        invisible, because repeats from one call site are collapsed, which is why the flag is not
+        shared across clones. Both counts are pinned so neither can drift from the docs unnoticed.
+        """
+        import temporalio.workflow
+
+        monkeypatch.setattr(temporalio.workflow, 'in_workflow', lambda: True)
+
+        from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
+        from pydantic_ai.models.function import AgentInfo, FunctionModel
+
+        def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            if not any(isinstance(message, ModelResponse) for message in messages):
+                return ModelResponse(parts=[ToolCallPart('run_code', {'code': 'await add(a=1, b=2)'})])
+            return ModelResponse(parts=[TextPart('done')])
+
+        async def count_with(action: Literal['default', 'always']) -> int:
+            agent: Agent[object, str] = Agent(
+                FunctionModel(model_fn),
+                toolsets=[_build_function_toolset(add)],
+                capabilities=[CodeMode[object]()],
+            )
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter(action)
+                for _ in range(2):
+                    await agent.run('go')
+            return len([w for w in caught if 'not enforcing `max_duration_secs`' in str(w.message)])
+
+        # What a caller on stock settings sees: one report, however many runs.
+        assert await count_with('default') == 1
+        # Without deduplication the per-run reset is visible, which is what the docs describe.
+        assert await count_with('always') == 2
+
     async def test_call_and_memory_caps_still_apply_in_workflow_code(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Only the elapsed-time cap is replay-sensitive, so the other two keep working.
 

@@ -594,8 +594,11 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
     # `get_instructions` in the same step. Empty when there's nothing to surface.
     _last_catalog: str = field(default='', init=False, repr=False)
 
-    # Set once the elapsed-time cap has been reported as unenforced, so a long run warns per
-    # capability rather than per `run_code` call.
+    # Set once the elapsed-time cap has been reported as unenforced, so a run warns once rather
+    # than once per `run_code` call. `for_run` clones with `replace`, which reinitializes this, so
+    # an agent reused across runs reports again on each one. That is left alone deliberately:
+    # Python's default filter collapses repeats from one call site, so a caller sees it once
+    # anyway, and sharing the flag across clones would be machinery for an invisible difference.
     _warned_unenforced_duration: bool = field(default=False, init=False, repr=False, compare=False)
 
     # Tracks deferred-tool names we've already warned about so we don't spam the

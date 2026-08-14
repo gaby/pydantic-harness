@@ -180,7 +180,7 @@ workflow-side under `TemporalDurability` and its snippets are re-executed during
 elapsed-time decision would be measured again rather than replayed from history: the same snippet
 could finish on the original worker and time out under replay load, changing whether a retry
 happened and so which activities the workflow scheduled. `CodeMode` therefore drops
-`max_duration_secs` there and warns once with a `RuntimeWarning` that it is doing so. **Inside a
+`max_duration_secs` there and warns once per run with a `RuntimeWarning` that it is doing so. **Inside a
 Temporal workflow, nothing here bounds sandbox CPU time**; the applicable guidance is the one below
 under Temporal durability, to keep sandbox loops bounded in the snippets themselves. This is
 specific to Temporal rather than to durability in general: a DBOS workflow enforces the cap
@@ -270,9 +270,9 @@ computation inside `run_code`, so keep sandbox loops bounded.
 That guidance is what bounds sandbox CPU time here, because `resource_limits['max_duration_secs']`
 is not enforced in workflow code. Enforcing it would re-measure elapsed time on every replay, and a
 snippet near the threshold could pass once and time out the next time, changing the recorded
-history. `CodeMode` drops the cap there and warns once with a `RuntimeWarning`; the warning names
-the setting so the gap between what was configured and what applies is visible rather than
-discovered later. `max_memory` and `max_tool_calls` still apply. A builtin warning category is used
+history. `CodeMode` drops the cap there and warns once per run with a `RuntimeWarning`; the warning
+names the setting so the gap between what was configured and what applies is visible rather
+than discovered later. `max_memory` and `max_tool_calls` still apply. A builtin warning category is used
 deliberately: the workflow sandbox re-imports harness modules, so a harness-defined category would
 be a different class than the one a filter names and could not be suppressed.
 
