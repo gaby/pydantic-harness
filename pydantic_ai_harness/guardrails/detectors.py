@@ -101,52 +101,74 @@ def _rewrite_text_part(part: str | TextContent, text: str) -> str | TextContent:
     return text if isinstance(part, str) else replace(part, content=text)
 
 
+def _merge_span(
+    run: Sequence[UserContent], text_indexes: Sequence[int], first_text: str | TextContent, text: str
+) -> list[UserContent]:
+    """Collapse a span's text into one part, keeping every marker on a side it still has.
+
+    A marker before the first text part or after the last one keeps its side. The text it
+    bounded is still on that side, so moving it would change what the caller asked to be
+    cached for nothing. Only a marker between two merged texts has lost the split it marked,
+    and that one goes ahead of the merged text, which narrows the cached prefix rather than
+    widening it over text the caller kept outside.
+    """
+    first, last = text_indexes[0], text_indexes[-1]
+    interior = [part for part in run[first:last] if not isinstance(part, str | TextContent)]
+    return [*run[:first], *interior, _rewrite_text_part(first_text, text), *run[last + 1 :]]
+
+
 def _detect_text_run(
     detector: TextDetector, run: Sequence[UserContent]
 ) -> tuple[GuardrailResult | None, Sequence[UserContent], bool]:
     """Run `detector` over one stretch of text the model reads as one span, per part and then joined.
 
     The model reads that span as one string, so a secret split across two parts of it
-    matches nothing in either part on its own. The joined pass catches that. It runs
-    over the per-part rewrites rather than the originals, so a secret that sits inside
-    one part is redacted in place and the parts keep their own boundaries and metadata.
-    Only a match that survives per-part redaction -- one that straddles a boundary --
-    collapses the span into a single part, which is the shortest text that can carry
-    the redaction.
+    matches nothing in either part on its own. The joined pass catches that, and it scans
+    the span's *original* text, not the per-part rewrites. Redacting a fragment can strip
+    the very characters a pattern anchors on -- `sk-` at the front of a key -- which would
+    leave the rest of the value exposed while the joined pass reported the span clean. It
+    can hide a terminal verdict the same way.
 
-    A span holding one text part is scanned once. It has no boundary for a value to straddle,
-    so the joined pass would hand `detector` the string it just saw. That matters beyond the
-    wasted call: `TextDetector` is a public extension point, so a detector that is stateful
-    or bills per call would otherwise see `content='x'` and `content=['x']` differently.
+    The span keeps its parts when sanitizing them one by one already produced the text that
+    sanitizing the whole span produces. Then the boundaries carry nothing, and each part
+    keeps its own metadata. When the two differ, something is only reachable across a
+    boundary, and the span collapses to the whole-span sanitization -- the text the same
+    content would have got as a single string.
+
+    A span holding one text part is scanned once. Its whole-span sanitization is by
+    definition its per-part one, so the joined pass could only agree with itself. That
+    matters beyond the wasted call: `TextDetector` is a public extension point, so a
+    detector that is stateful or bills per call would otherwise see `content='x'` and
+    `content=['x']` differently.
 
     A span can hold parts that carry no model content, which is why the joined pass keys on
-    the number of text parts rather than the length of `run`. Those markers are kept. When a
-    straddling match collapses the span they move ahead of the merged text, because the split
-    they marked no longer exists: putting them after it would pull the text that followed a
-    `CachePoint` into the cached prefix, and widening what a caller marked as cacheable is a
-    worse failure than narrowing it.
+    the number of text parts rather than the length of `run`.
 
     Returns a terminal verdict, the parts to keep, and whether any text changed.
     """
     text_parts: list[str | TextContent] = []
+    text_indexes: list[int] = []
+    originals: list[str] = []
     texts: list[str] = []
     replaced = False
-    for part in run:
+    for index, part in enumerate(run):
         if not isinstance(part, str | TextContent):
             continue
-        verdict, replacement = _detect_content_text(detector, _text_of(part))
+        original = _text_of(part)
+        verdict, replacement = _detect_content_text(detector, original)
         if verdict is not None:
             return verdict, run, False
         replaced |= replacement is not None
         text_parts.append(part)
-        texts.append(_text_of(part) if replacement is None else replacement)
+        text_indexes.append(index)
+        originals.append(original)
+        texts.append(original if replacement is None else replacement)
     if len(texts) > 1:
-        verdict, joined = _detect_content_text(detector, ''.join(texts))
+        verdict, joined = _detect_content_text(detector, ''.join(originals))
         if verdict is not None:
             return verdict, run, False
-        if joined is not None:
-            markers = [part for part in run if not isinstance(part, str | TextContent)]
-            return None, [*markers, _rewrite_text_part(text_parts[0], joined)], True
+        if joined is not None and joined != ''.join(texts):
+            return None, _merge_span(run, text_indexes, text_parts[0], joined), True
     rewritten: list[UserContent] = []
     replacements = iter(texts)
     for part in run:
