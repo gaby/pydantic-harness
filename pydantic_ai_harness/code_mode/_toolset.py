@@ -66,15 +66,16 @@ CodeModeMount = MountDir | list[MountDir]
 # host adds to an error, so these are separate and much smaller: the summary exists to identify
 # calls, not to redeliver their payloads.
 _RETRY_VALUE_PREVIEW_CHARS = 120
+_RETRY_PREVIEW_ITEMS = 5
 _RETRY_SUMMARY_MAX_CHARS = 2000
 
 
 # One entry per limit `CodeModeResourceLimits` exposes, mapped to the wording Monty reports when
 # it trips. Monty offers no typed marker for either, so its phrasing is load-bearing here and
-# nowhere else. `test_every_sandbox_limit_has_an_exhaustion_marker` pins these keys against the
-# TypedDict, so a limit added there without an entry here fails that test rather than silently
-# losing its retry summary, and the per-limit tests drive real exhaustion, so a Monty reword fails
-# them rather than quietly disabling recognition.
+# nowhere else. `test_every_resource_limit_reports_started_calls_when_exhausted` exhausts each
+# option the type declares and checks the summary survives, so a limit added without an entry here
+# fails there rather than silently losing its summary, and a Monty reword fails it rather than
+# quietly disabling recognition.
 _SANDBOX_LIMIT_MARKERS = {
     'max_duration_secs': 'time limit exceeded',
     'max_memory': 'memory limit exceeded',
@@ -123,12 +124,48 @@ def _is_duration_exhausted(error: MontyRuntimeError) -> bool:
     return not error.traceback() and _exhausted_sandbox_limit(error) == 'max_duration_secs'
 
 
-def _preview(value: object) -> str:
-    """Render a value for an error message, bounded so one large payload cannot flood the prompt."""
-    text = repr(value)
-    if len(text) <= _RETRY_VALUE_PREVIEW_CHARS:
-        return text
-    return f'{text[:_RETRY_VALUE_PREVIEW_CHARS]}... ({len(text)} chars total)'
+def _elided(count: int, shown: int, unit: str) -> str:
+    """Note how much a preview left out, or nothing when it left out nothing."""
+    return f' ... ({count} {unit} total)' if count > shown else ''
+
+
+def _preview(value: Any, *, nested: bool = False) -> str:
+    """Render a value for an error message, cutting it before rendering rather than after.
+
+    Rendering first and slicing after would copy the whole payload to produce 120 characters: a
+    20 MB tool result cost 40 MB of allocation that way, spent while the host is already handling
+    a resource failure. So each shape is cut at the source instead.
+
+    Only the shapes a tool result or argument can take are rendered: text, bytes, and containers
+    of those, one level deep. A nested container is reported by size rather than expanded, which
+    bounds the work without recursing to arbitrary depth. Anything else is named by type, since
+    calling `repr` on it is the unbounded allocation this exists to avoid -- a `BinaryContent`
+    result would otherwise render its entire payload.
+    """
+    limit = _RETRY_VALUE_PREVIEW_CHARS
+    items = _RETRY_PREVIEW_ITEMS
+    # `isinstance` on a bare `list`/`dict` narrows to an unparameterized generic, which reads as
+    # partially unknown under strict typing. Keeping an unnarrowed alias lets the checks stay
+    # `isinstance`, so subclasses still match, while the element access stays typed.
+    raw: Any = value
+    if isinstance(value, str):
+        return repr(value[:limit]) + _elided(len(value), limit, 'chars')
+    if isinstance(value, (bytes, bytearray)):
+        return repr(bytes(value[:limit])) + _elided(len(value), limit, 'bytes')
+    if isinstance(value, (list, tuple)):
+        if nested:
+            return f'[{len(raw)} items]'
+        rendered = ', '.join(_preview(item, nested=True) for item in raw[:items])
+        return f'[{rendered}]' + _elided(len(raw), items, 'items')
+    if isinstance(value, dict):
+        if nested:
+            return f'{{{len(raw)} items}}'
+        pairs = list(raw.items())[:items]
+        rendered = ', '.join(f'{_preview(k, nested=True)}: {_preview(v, nested=True)}' for k, v in pairs)
+        return '{' + rendered + '}' + _elided(len(raw), items, 'items')
+    if value is None or isinstance(value, (int, float)):
+        return repr(value)
+    return f'<{type(value).__name__}>'
 
 
 def _describe_started_calls(calls: dict[str, ToolCallPart], returns: dict[str, ToolReturnPart]) -> str:

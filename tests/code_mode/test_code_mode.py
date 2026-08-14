@@ -738,19 +738,91 @@ class TestCodeMode:
         assert "add({'a': 1, 'b': 2}) returned 3" in message
         assert 'restart' not in message
 
-    async def test_every_sandbox_limit_has_an_exhaustion_marker(self) -> None:
-        """Every limit callers can set has to be recognizable when it trips.
+    async def test_every_resource_limit_reports_started_calls_when_exhausted(self) -> None:
+        """Exhausting any option a caller can set still reports the calls that already ran.
 
-        The retry summary is gated on recognizing an exhausted limit, so a limit added to
-        `CodeModeResourceLimits` without a marker would silently stop reporting the calls that
-        already ran. Checking the table against the type is what turns that into a failure here
-        rather than a gap found in production.
+        Driven per limit rather than by inspecting the recognizer, so it tests the behaviour the
+        recognizer exists to provide. Adding an option to `CodeModeResourceLimits` without a case
+        here fails the coverage assertion below, which is what stops a new limit from silently
+        losing its summary.
         """
-        from pydantic_ai_harness.code_mode._toolset import (  # pyright: ignore[reportPrivateUsage]
-            _SANDBOX_LIMIT_MARKERS,
+        exhaust_by_limit: dict[str, tuple[CodeModeResourceLimits, str]] = {
+            'max_duration_secs': (
+                {'max_duration_secs': 0.3},
+                'y = 0\nfor i in range(100_000_000):\n    y += i\ny',
+            ),
+            'max_memory': ({'max_memory': 8 * 1024 * 1024}, 'x = [0] * 50_000_000\nlen(x)'),
+        }
+        assert set(exhaust_by_limit) == set(CodeModeResourceLimits.__annotations__), (
+            'a new resource limit needs a case here, so that exhausting it is shown to still '
+            'report the nested calls that already ran'
         )
 
-        assert set(_SANDBOX_LIMIT_MARKERS) == set(CodeModeResourceLimits.__annotations__)
+        for limits, exhaust in exhaust_by_limit.values():
+            wrapper = CodeMode[object](resource_limits=limits).get_wrapper_toolset(_build_function_toolset(add))
+            assert isinstance(wrapper, CodeModeToolset)
+            ctx = await build_ctx(None, wrapper)
+            tools = await wrapper.get_tools(ctx)
+
+            with pytest.raises(ModelRetry) as exc_info:
+                await wrapper.call_tool(
+                    'run_code',
+                    {'code': f'r = await add(a=1, b=2)\n{exhaust}'},
+                    ctx,
+                    tools['run_code'],
+                )
+            assert "add({'a': 1, 'b': 2}) returned 3" in exc_info.value.message
+
+    async def test_preview_bounds_every_payload_shape(self) -> None:
+        """Previews cut each shape at the source, including ones whose `repr` would be huge.
+
+        `BinaryContent` is the case that motivates naming a value by type: it reaches the summary
+        as the raw object, so rendering it would put its whole payload in the retry.
+        """
+        from pydantic_ai.messages import BinaryContent
+
+        def shapes(tag: str, rows: list[int], opts: dict[str, int]) -> dict[str, Any]:
+            """Return a mix of payload shapes."""
+            return {
+                'text': 'z' * 50_000,
+                'raw': b'\xff' * 50_000,
+                'blob': BinaryContent(data=b'\x89PNG' * 20_000, media_type='image/png'),
+                'nested': {'a': 1, 'b': 2},
+                'count': 7,
+            }
+
+        def many_rows() -> list[int]:
+            """Return a long list."""
+            return list(range(50))
+
+        wrapper = CodeMode[object](max_tool_calls=2).get_wrapper_toolset(_build_function_toolset(shapes, many_rows))
+        assert isinstance(wrapper, CodeModeToolset)
+        ctx = await build_ctx(None, wrapper)
+        tools = await wrapper.get_tools(ctx)
+
+        with pytest.raises(ModelRetry) as exc_info:
+            await wrapper.call_tool(
+                'run_code',
+                {
+                    'code': (
+                        "a = await shapes(tag='t', rows=[1, 2], opts={'k': 1})\n"
+                        'b = await many_rows()\n'
+                        'c = await many_rows()\n'
+                        'a'
+                    )
+                },
+                ctx,
+                tools['run_code'],
+            )
+
+        message = exc_info.value.message
+        assert len(message) < 3_000, f'preview grew to {len(message)} chars'
+        assert '50000 chars total' in message  # long text cut at the source
+        assert '50000 bytes total' in message  # long bytes cut at the source
+        assert '<BinaryContent>' in message  # named by type, never rendered
+        assert '{2 items}' in message  # nested container reported by size
+        assert '[2 items]' in message  # nested list argument likewise
+        assert '(50 items total)' in message  # long list cut to its first few
 
     async def test_ordinary_runtime_error_does_not_mention_restart(self) -> None:
         """A plain exception keeps the message it always had; the hint is not bolted onto everything."""
