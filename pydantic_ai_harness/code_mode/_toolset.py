@@ -166,8 +166,8 @@ def _type_name(value: Any) -> str:
     directly, so no metaclass sits in front of it. It returns an exact `str`, cut here because a
     class name is only as short as whoever wrote it.
 
-    No tool result reaches this with a hostile metaclass today -- Monty rejects objects outside its
-    value set, leaving pydantic-ai's own multi-modal content as the reachable case. It is written
+    Monty rejects objects outside its value set, so the reachable case here is pydantic-ai's own
+    multi-modal content and no tool result arrives with a hostile metaclass today. It is written
     this way so the rule stated in `_render` holds with no exception to remember.
     """
     return str.__getitem__(type.__dict__['__name__'].__get__(type(value)), _RETRY_TEXT_HEAD)
@@ -200,21 +200,23 @@ def _render(value: Any, *, nested: bool = False) -> str:
     rejects one as a tool result, at any nesting depth, before a summary can be built; a future
     Monty that accepts it gets `<bytearray>` until a branch is written for it.
 
-    The invariant that keeps every branch bounded is that no expression here dispatches through a
-    method the value's own type can define. `isinstance` matches subclasses, so every length,
-    slice, item view and repr goes through the exact builtin's implementation called unbound --
-    `str.__len__(value)`, `list.__getitem__(value, head)`, `dict.items(value)`. Each of those
-    reads the object's real storage and returns an exact builtin, so what comes back is bounded by
-    the cut rather than by anything the subclass chose to return. Left as `len(value)` or
-    `value[:n]`, a subclass supplies its own, and a `__getitem__` that ignores the slice and
+    The invariant that keeps every branch bounded is that no expression here obtains a value
+    through a name the object's own type can define. `isinstance` matches subclasses, so every
+    length, slice, item view and repr goes through the exact builtin's implementation called
+    unbound -- `str.__len__(value)`, `list.__getitem__(value, head)`, `dict.items(value)`. Each of
+    those reads the object's real storage and returns an exact builtin, so what comes back is
+    bounded by the cut rather than by anything the subclass chose to return. Left as `len(value)`
+    or `value[:n]`, a subclass supplies its own, and a `__getitem__` that ignores the slice and
     returns the whole payload defeats the cut. No guard catches that, because returning a large
-    result is not a failure.
+    result is not a failure. The one name still consulted on the object is `__class__`, which
+    `isinstance` falls back to when the exact-type check misses; it can raise, which `_preview`
+    covers, but nothing here uses what it returns, so it cannot enlarge a result.
 
-    Checking a new branch is therefore a static question, answered by reading the expression, not
-    by running a subclass past it and watching: name every operator, call and conversion in it,
-    say which dunder or method each dispatches through, and confirm the value's type cannot define
-    that name. Observing a well-behaved subclass proves nothing, since it describes what a
-    cooperative type does rather than what a hostile one can do.
+    Checking a new branch is therefore a static question, answered by reading the expression rather
+    than by running a subclass past it and watching: name every operator, call and conversion in
+    it, say which dunder or method each dispatches through, and confirm the value's type cannot
+    define that name. What a well-behaved subclass does under observation says nothing about what a
+    hostile one can do, which is how the branches below were first cleared and got this wrong.
 
     So the question to ask when adding a shape is not "does this branch copy the value", and not
     "can rendering it raise", but "can rendering it produce an unbounded result by any means,
@@ -224,7 +226,7 @@ def _render(value: Any, *, nested: bool = False) -> str:
     items = _RETRY_PREVIEW_ITEMS
     # `isinstance` on a bare `list`/`dict` narrows to an unparameterized generic, which reads as
     # partially unknown under strict typing. Keeping an unnarrowed alias lets the checks stay
-    # `isinstance`, so subclasses still match, while the element access stays typed.
+    # `isinstance`, so subclasses still match, while the builtin calls below stay typed.
     raw: Any = value
     if isinstance(value, str):
         return str.__repr__(str.__getitem__(raw, _RETRY_TEXT_HEAD)) + _elided(str.__len__(raw), limit, 'chars')
@@ -266,11 +268,11 @@ def _preview(value: Any) -> str:
     summary exists to prevent, so a value that cannot be rendered is named instead -- the answer
     already used for objects like `BinaryContent`.
 
-    Nothing a tool can currently return reaches an expression here that runs the value's own code:
-    every branch in `_render` dispatches through an exact builtin, and the only non-builtin values
-    Monty lets through are pydantic-ai's multi-modal content types. So the handler is a standing
-    guard over a rule rather than a fix for a known input -- worth keeping because the rule is easy
-    to break by adding a branch, and the cost of breaking it is the whole retry.
+    Every branch in `_render` dispatches through an exact builtin, and Monty rejects objects
+    outside its value set, so the paths that would run a value's own code are not reachable from a
+    tool result today. The handler is therefore a standing guard over a rule rather than a fix for
+    a known input -- worth keeping because the rule is easy to break by adding a branch, and the
+    cost of breaking it is the whole retry.
 
     The guard covers exactly one value. The caller still produces every other entry, and a fault in
     the summary's own logic still surfaces. It bounds what can raise, not what can take a long
