@@ -991,6 +991,79 @@ class TestCodeMode:
                 tools['run_code'],
             )
 
+    async def test_scalars_render_from_the_builtin_not_the_value(self) -> None:
+        """A scalar subclass cannot render itself into the retry.
+
+        The guard around a value only bounds what raises, and a `__repr__` returning megabytes
+        succeeds, so the branch has to avoid calling the value's own renderer at all. Covers each
+        scalar shape, since they take separate branches.
+        """
+
+        class LoudInt(int):
+            """An int whose repr is enormous."""
+
+            def __repr__(self) -> str:
+                return 'x' * 5_000_000
+
+        class LoudFloat(float):
+            """A float whose repr is enormous."""
+
+            def __repr__(self) -> str:
+                return 'y' * 5_000_000
+
+        # The overrides really would flood the retry, which is what makes the branch matter.
+        assert len(repr(LoudInt(5))) == 5_000_000
+        assert len(repr(LoudFloat(1.5))) == 5_000_000
+
+        def loud_int() -> int:
+            """Return an int with an overridden repr."""
+            return LoudInt(5)
+
+        def loud_float() -> float:
+            """Return a float with an overridden repr."""
+            return LoudFloat(1.5)
+
+        def flag() -> bool:
+            """Return a boolean."""
+            return True
+
+        def nothing() -> None:
+            """Return nothing."""
+            return None
+
+        wrapper = CodeMode[object](max_tool_calls=4).get_wrapper_toolset(
+            _build_function_toolset(loud_int, loud_float, flag, nothing)
+        )
+        assert isinstance(wrapper, CodeModeToolset)
+        ctx = await build_ctx(None, wrapper)
+        tools = await wrapper.get_tools(ctx)
+
+        with pytest.raises(ModelRetry) as exc_info:
+            await wrapper.call_tool(
+                'run_code',
+                {
+                    'code': (
+                        'a = await loud_int()\n'
+                        'b = await loud_float()\n'
+                        'c = await flag()\n'
+                        'd = await nothing()\n'
+                        'e = await loud_int()\n'
+                        'e'
+                    )
+                },
+                ctx,
+                tools['run_code'],
+            )
+
+        message = exc_info.value.message
+        assert len(message) < 2_000, f'summary grew to {len(message)} chars'
+        assert 'returned 5' in message  # the number, not the override
+        assert 'returned 1.5' in message
+        assert 'returned True' in message
+        assert 'returned None' in message
+        assert 'xxxx' not in message
+        assert 'yyyy' not in message
+
     async def test_one_unrenderable_value_does_not_break_the_summary(self) -> None:
         """A value that cannot be rendered degrades to its type name; everything else survives.
 

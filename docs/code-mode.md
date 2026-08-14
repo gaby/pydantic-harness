@@ -218,8 +218,10 @@ nothing stops it from calling those tools again, so treat it as informing the ne
 than preventing a repeat.
 
 Override them with `resource_limits={'max_duration_secs': 10, 'max_memory': 134_217_728}` and
-`max_tool_calls=25`. Pass `resource_limits='unlimited'` only when another execution boundary
-supplies equivalent limits.
+`max_tool_calls=25`. A mapping is merged onto the defaults rather than replacing them, so
+`resource_limits={'max_memory': 134_217_728}` changes the heap and leaves the 30-second cap in
+place, and a snippet can still end in a timeout retry. `resource_limits='unlimited'` is what clears
+both caps; pass it only when another execution boundary supplies equivalent limits.
 
 ## REPL state
 

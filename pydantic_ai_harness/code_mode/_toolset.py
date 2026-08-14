@@ -159,11 +159,16 @@ def _render(value: Any, *, nested: bool = False) -> str:
     calling `repr` on it is the unbounded allocation this exists to avoid -- a `BinaryContent`
     result would otherwise render its entire payload.
 
-    When adding a shape here, the question to ask is not "does this branch copy the value" but
-    "can rendering this branch allocate without bound, or raise". Integers pass the first and
-    fail the second: nothing is traversed, and yet `repr` builds the entire decimal expansion,
-    and above the interpreter's digit limit raises instead of returning. Asking only the first
-    question is what let that through.
+    The invariant that keeps every branch bounded is that none of them calls a method the value's
+    own type can override. Text is sliced and bytes converted, which yield exact builtins before
+    anything renders them; containers are assembled here rather than through their `__repr__`;
+    scalars go through the builtin's own `__repr__`. A subclass can otherwise supply a renderer
+    that returns megabytes, which no guard catches, because returning a large string is not a
+    failure.
+
+    So the question to ask when adding a shape is not "does this branch copy the value", and not
+    "can rendering it raise", but "can rendering it produce an unbounded result by any means,
+    including a call that succeeds". Integers pass the first two and failed the third.
     """
     limit = _RETRY_VALUE_PREVIEW_CHARS
     items = _RETRY_PREVIEW_ITEMS
@@ -186,14 +191,20 @@ def _render(value: Any, *, nested: bool = False) -> str:
         pairs = islice(raw.items(), items)
         rendered = ', '.join(f'{_render(k, nested=True)}: {_render(v, nested=True)}' for k, v in pairs)
         return '{' + rendered + '}' + _elided(len(raw), items, 'items')
-    if isinstance(value, int) and not isinstance(value, bool):
-        # `repr` on a large int is not bounded by its own size: it builds the whole decimal
-        # expansion, and above the interpreter's digit limit it raises `ValueError` instead,
-        # which here would replace the retry with an uncaught host error. `bit_length` answers
-        # how big it is without rendering it.
-        return repr(value) if value.bit_length() <= _RETRY_INT_BITS else f'<int of {value.bit_length()} bits>'
-    if value is None or isinstance(value, (bool, float)):
-        return repr(value)
+    if isinstance(value, bool):
+        return bool.__repr__(value)
+    if isinstance(value, int):
+        # `int.__repr__` and `int.bit_length`, not the value's own, so a subclass cannot render
+        # this instead. Beyond that, `repr` on a large int is not bounded by the size of the
+        # number: it builds the whole decimal expansion, and above the interpreter's digit limit
+        # raises `ValueError`, which here would replace the retry with an uncaught host error.
+        # `bit_length` answers how big it is without rendering it.
+        bits = int.bit_length(value)
+        return int.__repr__(value) if bits <= _RETRY_INT_BITS else f'<int of {bits} bits>'
+    if isinstance(value, float):
+        return float.__repr__(value)
+    if value is None:
+        return 'None'
     return f'<{type(value).__name__}>'
 
 
