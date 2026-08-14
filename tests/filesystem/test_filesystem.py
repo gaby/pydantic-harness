@@ -616,6 +616,31 @@ class TestSearchFiles:
 
         assert result == 'real.txt:1:cycle needle'
 
+    async def test_search_skips_entry_whose_strict_resolve_raises(
+        self, toolset: FileSystemToolset[None], fs_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An entry swapped for a cycle after `is_file` is skipped, not raised.
+
+        The real swap is a race, so `Path.resolve` is patched to fail for one
+        entry the way a cycle would. `RuntimeError` is the 3.10-3.12 form and is
+        the one that matters: `_recoverable` does not convert it, so an
+        unhandled one aborts the run instead of returning the other matches.
+        """
+        (fs_root / 'real.txt').write_text('swap needle\n')
+        (fs_root / 'swapped.txt').write_text('swap needle\n')
+        unpatched = Path.resolve
+
+        def failing_resolve(self: Path, strict: bool = False) -> Path:
+            if self.name == 'swapped.txt':
+                raise RuntimeError(f'Symlink loop from {str(self)!r}')
+            return unpatched(self, strict=strict)
+
+        monkeypatch.setattr(Path, 'resolve', failing_resolve)
+
+        result = await toolset.search_files('swap needle')
+
+        assert result == 'real.txt:1:swap needle'
+
 
 class TestFindFiles:
     async def test_find_glob(self, toolset: FileSystemToolset[None]) -> None:

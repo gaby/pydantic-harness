@@ -409,7 +409,7 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
             # 3.10-3.12 and as `OSError` from 3.13 on, where pathlib moved onto
             # `os.path.realpath`. `_recoverable` converts neither, so skipping the
             # entry here keeps one unreadable path from aborting the run.
-            except (OSError, RuntimeError):  # pragma: no cover
+            except (OSError, RuntimeError):
                 continue
             if _is_binary(raw):
                 continue
