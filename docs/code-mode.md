@@ -184,8 +184,10 @@ model retry reporting the timeout until one of those resets happens.
 
 Nested tool calls are bounded separately by `max_tool_calls`, which defaults to 100 per `run_code`
 call. The budget is reserved before each call is scheduled, so a snippet cannot dispatch more work
-than it allows. A call past the budget fails at its call site inside the sandbox, so a snippet that
-catches the error keeps the results of the calls that already completed and can return them.
+than it allows. A call past the budget fails at its call site inside the sandbox: a snippet that
+catches the error keeps the results of the calls that already completed and can return them, and a
+snippet that lets it propagate gets a model retry that lists those calls with their arguments and
+results, so the retry does not repeat their side effects.
 
 Override them with `resource_limits={'max_duration_secs': 10, 'max_memory': 134_217_728}` and
 `max_tool_calls=25`. Pass `resource_limits='unlimited'` only when another execution boundary

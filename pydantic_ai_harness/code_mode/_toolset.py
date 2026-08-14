@@ -596,6 +596,7 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
         nested_calls: dict[str, ToolCallPart] = {}
         nested_returns: dict[str, ToolReturnPart] = {}
         call_counter = 0
+        budget_exhausted = False
 
         def dispatch_tool_call(sandbox_name: str, kwargs: dict[str, Any]) -> Coroutine[Any, Any, Any]:
             """Reserve nested-call budget, then build the coroutine that runs the call.
@@ -607,8 +608,12 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
             Refusing here means no task is created; the executor hands the error to the sandbox at
             the call site, so calls that already completed keep their recorded results.
             """
-            nonlocal call_counter
+            nonlocal call_counter, budget_exhausted
             if call_counter >= self.max_tool_calls:
+                # Recorded so the retry can name the calls that already ran if the snippet does
+                # not catch this. Reaching the budget is not itself the failure: a snippet that
+                # handles the error still returns normally, carrying its metadata.
+                budget_exhausted = True
                 raise RuntimeError(
                     f'Code mode allows {self.max_tool_calls} nested tool calls per `run_code` call '
                     'and this snippet asked for more. Call fewer tools, for example by filtering '
@@ -726,7 +731,20 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
             # ModelRetry from a wrapped tool gets double-wrapped
             # (ModelRetry → MontyRuntimeError → ModelRetry), but the retry
             # semantics are the same -- the model gets another chance.
-            raise ModelRetry(f'Runtime error:\n{capture.prepend_to(e.display())}') from e
+            message = f'Runtime error:\n{capture.prepend_to(e.display())}'
+            if budget_exhausted and nested_returns:
+                # A retry is the only record the model gets of an uncaught failure, and the
+                # calls below already ran. Without naming them the model reruns their side
+                # effects when it retries with a smaller batch.
+                completed = '\n'.join(
+                    f'- {part.tool_name}({nested_calls[call_id].args!r}) -> {part.content!r}'
+                    for call_id, part in nested_returns.items()
+                )
+                message += (
+                    f'\n\nThese {len(nested_returns)} nested tool calls completed before the limit '
+                    f'was reached. Do not call them again:\n{completed}'
+                )
+            raise ModelRetry(message) from e
         except MontyCrashedError as e:
             # The worker died mid-feed (e.g. the code exhausted its memory or hit the
             # request timeout) and the REPL state died with it; the pool replaces the

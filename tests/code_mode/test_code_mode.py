@@ -595,6 +595,39 @@ class TestCodeMode:
         assert len(result.metadata['tool_calls']) == 3
         assert len(result.metadata['tool_returns']) == 3
 
+    async def test_uncaught_budget_exhaustion_names_completed_calls(self) -> None:
+        """An uncaught refusal still tells the model which calls already ran.
+
+        This is the shape a model actually writes: a plain sequential loop with no `try`. The
+        retry is the only record it gets, so without the completed calls it reruns their side
+        effects when it retries with a smaller batch.
+        """
+        executed: list[int] = []
+
+        def record(value: int) -> int:
+            """Record a call."""
+            executed.append(value)
+            return value
+
+        wrapper = CodeMode[object](max_tool_calls=3).get_wrapper_toolset(_build_function_toolset(record))
+        assert isinstance(wrapper, CodeModeToolset)
+        ctx = await build_ctx(None, wrapper)
+        tools = await wrapper.get_tools(ctx)
+
+        with pytest.raises(ModelRetry) as exc_info:
+            await wrapper.call_tool(
+                'run_code',
+                {'code': 'out = []\nfor i in range(10):\n    out.append(await record(value=i))\nout'},
+                ctx,
+                tools['run_code'],
+            )
+
+        assert executed == [0, 1, 2]
+        message = exc_info.value.message
+        assert 'These 3 nested tool calls completed' in message
+        for value in (0, 1, 2):
+            assert f"record({{'value': {value}}}) -> {value}" in message
+
     async def test_exhausted_budget_on_sequential_tool_preserves_completed_calls(self) -> None:
         """The budget refusal reaches the sandbox for inline-resolved tools too.
 
