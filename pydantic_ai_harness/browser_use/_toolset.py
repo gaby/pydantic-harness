@@ -49,8 +49,20 @@ _FILE_SCHEME_ALLOWLIST_ERROR = (
 _TEARDOWN_TIMEOUT = 30
 
 
+def _strip_trailing_dot(hostname: str) -> str:
+    """Drop a terminal DNS dot, which names the same host: `localhost.` is `localhost`.
+
+    Dropping it makes an entry marginally stricter than the caller wrote, because
+    browser-use matches hostnames literally and so will not match a `https://host./`
+    URL against the canonical pattern. That is the safe direction: left in place, the
+    dot lets an entry name a host without resembling it.
+    """
+    return hostname[:-1] if hostname.endswith('.') else hostname
+
+
 def _restrict_to_http_schemes(domain: str) -> list[str]:
     """Scheme-qualify a host-only allowlist entry so it cannot admit a `file://` URL."""
+    domain = _strip_trailing_dot(domain)
     restricted = [f'{_HTTP_SCHEME_GLOB}://{domain}']
     if '*' not in domain and domain.count('.') == 1:
         restricted.append(f'{_HTTP_SCHEME_GLOB}://www.{domain}')
@@ -129,7 +141,7 @@ def _glob_hostname(pattern: str) -> str:
     host, separator, port = authority.rpartition(':')
     if separator and ']' not in port:
         authority = host
-    return authority.lower()
+    return _strip_trailing_dot(authority.lower())
 
 
 def _pattern_allows_localhost(pattern: str) -> bool:
@@ -137,11 +149,17 @@ def _pattern_allows_localhost(pattern: str) -> bool:
 
     Every allowlist reaching here is normalized first, so an entry is either
     scheme-qualified or a `*.`-prefixed domain glob.
+
+    Matching representative hosts against the entry catches globs, but only for hosts
+    the samples name. A concrete `<label>.localhost` is loopback under RFC 6761 without
+    resembling any sample, so the suffix is tested directly as well.
     """
     if pattern.startswith('*.'):
-        domain = pattern[2:]
+        domain = _strip_trailing_dot(pattern[2:].lower())
         return any(host == domain or host.endswith(f'.{domain}') for host in _LOCALHOST_HOSTS)
     hostname = _glob_hostname(pattern)
+    if hostname.endswith('.localhost') or hostname.startswith('localhost.'):
+        return True
     return any(fnmatch(host, hostname) for host in _LOCALHOST_HOSTS)
 
 

@@ -1464,6 +1464,23 @@ class TestLocalFileNavigation:
         assert await self._navigation_allowed(session, 'file://localhost/etc/passwd') is False
         assert await self._navigation_allowed(session, 'https://ab.example.com/') is True
 
+    @pytest.mark.parametrize('entry', ['localhost.', 'www.localhost', 'api.localhost', '*.localhost.'])
+    async def test_localhost_by_another_name_is_excluded_from_an_allowlist(self, entry: str) -> None:
+        """A terminal DNS dot and an RFC 6761 `.localhost` label both resolve to loopback.
+
+        Each names localhost without matching the representative hostnames, so an
+        allowlist of only these must still be refused under `block_ip_addresses=True`.
+        """
+        with pytest.raises(ValueError, match='permits only localhost'):
+            await self._resolved_session([entry], True)
+
+    async def test_a_trailing_dot_does_not_smuggle_localhost_past_the_allowlist(self) -> None:
+        """`localhost.` is the same host as `localhost`, so it cannot buy a private-network exemption."""
+        session = await self._resolved_session(['localhost.', 'example.com'], True)
+        assert await self._navigation_allowed(session, 'http://localhost.:8080/') is False
+        assert await self._navigation_allowed(session, 'http://localhost:8080/') is False
+        assert await self._navigation_allowed(session, 'https://example.com/') is True
+
     async def test_narrowing_a_scheme_glob_keeps_only_the_schemes_it_matched(self) -> None:
         """`????` admits `http` and `file` but not `https`, so `https` stays out."""
         session = await self._resolved_session(['????://intranet.example/*'], True)

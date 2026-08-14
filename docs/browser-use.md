@@ -206,7 +206,10 @@ origin.
   runs in `BrowserUseToolset`, so constructing the toolset directly gets it too.
 - **Private networks.** `block_ip_addresses=True` by default blocks direct IP
   addresses and common localhost hostnames, including when a profile has an
-  allowlist. Set it to `False` only when a task must reach an internal service.
+  allowlist. Names that resolve to loopback without being spelled `localhost`
+  count as localhost too: a terminal DNS dot (`localhost.`) is dropped before
+  matching, and any `<label>.localhost` name is treated as loopback per RFC 6761.
+  Set it to `False` only when a task must reach an internal service.
   browser-use does not resolve arbitrary hostnames before navigation, so use an
   explicit domain allowlist for sensitive browsing.
 - **Untrusted page content.** Browser results contain text from web pages.
