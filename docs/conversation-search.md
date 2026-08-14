@@ -19,7 +19,7 @@ Compaction capabilities (`SlidingWindowCompaction`, `SummarizingCompaction`, ...
 
 `ConversationSearch` persists nothing itself. It reads whatever a persistence capability already stores, through a `HistorySource`, and exposes one tool, `search_conversation_history`, that BM25-ranks that history so the model can pull exact details back into context on demand.
 
-The shipped source, `SnapshotHistorySource`, reads the snapshots `StepPersistence` writes: pair the two capabilities on a shared store instance and recall works with no extra write path, no ordering constraints, and no hook coordination.
+The shipped source, `SnapshotHistorySource`, reads the snapshots `StepPersistence` writes: pair the two capabilities on a shared store instance and recall works with no extra write path, no ordering constraints, and no hook coordination. Search is conversation-scoped by default, so pass the same `conversation_id` on every run that should share a corpus:
 
 ```python
 from pydantic_ai import Agent
@@ -36,9 +36,15 @@ agent = Agent(
         SlidingWindowCompaction(max_messages=40),
     ],
 )
+
+
+async def ask(question: str, conversation_id: str) -> str:
+    result = await agent.run(question, conversation_id=conversation_id)
+    return result.output
 ```
 
 - Ranking is BM25 (the algorithm behind Lucene/Elasticsearch), implemented in pure Python -- no new dependencies. Rare terms and exact matches score higher; multi-word queries score each word independently.
+- Reaching a past run requires both runs to carry the same `conversation_id`. `Agent.run(...)` assigns a fresh one per run when the argument is omitted, so omitting it confines a search to the calling run.
 - Results carry provenance (`run: ... | conversation: ...`), and the tool's optional `run_id` argument scopes a search to one run -- so a run referenced elsewhere (for example by a compaction receipt's transcript handle) is directly resolvable.
 - The search reads the store lazily at call time, so it always sees everything persisted so far, including earlier steps of the current run.
 
@@ -71,7 +77,9 @@ async def ask(question: str, user_id: str) -> str:
 
 The corpus is then restricted to runs whose `conversation_id` matches the calling run's, the tool's own description tells the model the restriction applies, and the tool's `run_id` argument cannot reach past it -- an out-of-scope run reports the same "no persisted history" answer as a run that does not exist.
 
-A run with no `conversation_id` searches nothing under this scope and the tool says why. Matching on "conversation id is unset" would pool every unlabelled run in the store into one corpus, which is the exposure the scope exists to prevent, so it fails closed instead. Pass `conversation_id=` to `Agent.run(...)` (the same value `StepPersistence` records on the run).
+`Agent.run(...)` assigns a fresh `conversation_id` per run when the argument is omitted, so an omitted id is not an error under this scope -- it confines the search to the calling run, and earlier runs started without an explicit id count as separate conversations. Pass the same `conversation_id=` on every run that should share a corpus (it is the value `StepPersistence` records on the run).
+
+A `RunContext` whose `conversation_id` is unset searches nothing under this scope and the tool says why. Matching on "conversation id is unset" would pool every unlabelled run in the store into one corpus, which is the exposure the scope exists to prevent, so it fails closed instead.
 
 Scoping is applied to the `RunRecord`s a `HistorySource` returns, so a custom source must populate `conversation_id` on them for the default scope to match anything. Set `scope='all'` only when the store is already isolated to one principal. This opt-in mode searches every run the source enumerates and can return verbatim excerpts from any of them.
 

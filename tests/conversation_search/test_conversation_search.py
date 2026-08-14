@@ -520,6 +520,20 @@ class TestSearchScope:
         assert 'passport' not in rendered.replace('Conversation-scoped', '')
         assert 'X99881234' not in rendered
 
+    async def test_empty_conversation_corpus_names_the_scope_without_naming_other_conversations(self) -> None:
+        """The default's common miss is a per-run id, not an unpaired `StepPersistence`."""
+        source = SnapshotHistorySource(await self._two_conversation_store())
+        rendered = await _search(source, 'passport', scope='conversation', conversation_id='conv-unseen')
+        assert 'No persisted history in this conversation yet' in rendered
+        assert '`conversation_id=`' in rendered
+        assert 'conv-alice' not in rendered
+        assert 'X99881234' not in rendered
+
+    async def test_empty_store_under_all_scope_points_at_step_persistence(self) -> None:
+        rendered = await _search(SnapshotHistorySource(InMemoryStepStore()), 'passport', scope='all')
+        assert 'No persisted conversation history to search yet' in rendered
+        assert '`StepPersistence`' in rendered
+
     async def test_conversation_scope_is_announced_in_the_tool_description(self) -> None:
         source = SnapshotHistorySource(InMemoryStepStore())
         scoped: ConversationSearchToolset[None] = ConversationSearchToolset(

@@ -360,6 +360,17 @@ class ConversationSearchToolset(FunctionToolset[AgentDepsT]):
             return f"No persisted history for run '{run_id}'."
         total_messages = sum(len(section.display_lines) for section in sections)
         if total_messages == 0:
+            if conversation_id is not None:
+                # Naming the scope keeps the "pair with `StepPersistence`" advice below from
+                # misdirecting a caller who already did: under conversation scope an empty
+                # corpus usually means the earlier runs carry a different conversation id.
+                # It reveals nothing about whether other conversations exist in the store.
+                return (
+                    'No persisted history in this conversation yet. Search covers only runs '
+                    "sharing this run's conversation id, and `Agent.run(...)` assigns a fresh "
+                    'one per run unless `conversation_id=` is passed, so earlier runs started '
+                    'without it belong to other conversations.'
+                )
             return (
                 'No persisted conversation history to search yet. History accumulates '
                 'as runs persist their steps (pair this capability with `StepPersistence` '

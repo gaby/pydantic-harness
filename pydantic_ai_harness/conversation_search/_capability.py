@@ -45,7 +45,16 @@ class ConversationSearch(AbstractCapability[AgentDepsT]):
             SlidingWindowCompaction(max_messages=40),
         ],
     )
+
+
+    async def ask(question: str, conversation_id: str) -> str:
+        result = await agent.run(question, conversation_id=conversation_id)
+        return result.output
     ```
+
+    Search is conversation-scoped by default, so reaching a past run requires both
+    runs to carry the same `conversation_id`. `Agent.run(...)` assigns a fresh one
+    per run when the argument is omitted, which confines a search to the calling run.
 
     Some compaction strategies persist their edits into the run's durable message
     history (`SummarizingCompaction` replaces summarized prefixes for good; a
