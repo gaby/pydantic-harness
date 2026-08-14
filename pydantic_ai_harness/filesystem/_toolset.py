@@ -380,22 +380,18 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         else:
             files = sorted(resolved.rglob('*'))
 
-        real_root = Path(os.path.realpath(self._root))
         for file_path in files:
+            try:
+                discovered_rel = str(file_path.relative_to(self._real_root))
+                file_path = self._safe_resolve(discovered_rel, write=True)
+            except (PermissionError, ValueError):
+                continue
             if not file_path.is_file():
                 continue
-            try:
-                rel_parts = file_path.relative_to(real_root).parts
-            except ValueError:  # pragma: no cover
-                continue
+            rel_parts = file_path.relative_to(self._real_root).parts
             if any(part.startswith('.') for part in rel_parts):
                 continue
-            rel_str = str(file_path.relative_to(real_root))
-            # Apply the same allow/deny/protected filtering used for direct
-            # access so a recursive search can't read patterns the agent
-            # couldn't otherwise read.
-            if not self._is_accessible(rel_str, write=True):
-                continue
+            rel_str = str(file_path.relative_to(self._real_root))
             if include_glob and not fnmatch.fnmatch(rel_str, include_glob):
                 continue
             try:
