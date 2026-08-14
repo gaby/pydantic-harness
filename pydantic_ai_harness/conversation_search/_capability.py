@@ -12,12 +12,18 @@ from pydantic_ai.toolsets import AgentToolset
 from pydantic_ai_harness.conversation_search._source import HistorySource
 from pydantic_ai_harness.conversation_search._toolset import ConversationSearchToolset, SearchScope
 
-_INSTRUCTIONS = (
+_INSTRUCTIONS_PREFIX = (
     'A `search_conversation_history` tool can retrieve exact details from persisted history: '
     'earlier turns that context compaction has since dropped from the live context, and past '
-    'runs in the same conversation. Reach for it when the current context, or a compaction '
-    'summary, lacks a detail you need.'
 )
+_INSTRUCTIONS_SUFFIX = ' Reach for it when the current context, or a compaction summary, lacks a detail you need.'
+
+_CONVERSATION_INSTRUCTIONS = f'{_INSTRUCTIONS_PREFIX}runs in the same conversation.{_INSTRUCTIONS_SUFFIX}'
+"""Instruction text under `scope='conversation'`, where the corpus stops at the conversation."""
+
+_ALL_INSTRUCTIONS = f'{_INSTRUCTIONS_PREFIX}runs persisted in the same store.{_INSTRUCTIONS_SUFFIX}'
+"""Instruction text under `scope='all'`. Naming the conversation boundary here would talk the
+model out of the cross-conversation recall that opting into `all` exists to enable."""
 
 
 @dataclass
@@ -53,8 +59,11 @@ class ConversationSearch(AbstractCapability[AgentDepsT]):
     ```
 
     Search is conversation-scoped by default, so reaching a past run requires both
-    runs to carry the same `conversation_id`. `Agent.run(...)` assigns a fresh one
-    per run when the argument is omitted, which confines a search to the calling run.
+    runs to share a `conversation_id`. pydantic-ai resolves one per run: an explicit
+    `conversation_id=` wins, otherwise the most recent `conversation_id` on
+    `message_history` is inherited, otherwise a fresh one is generated. Threading
+    `message_history` through follow-up runs keeps them in one conversation; runs
+    sharing neither an explicit id nor a history chain are separate.
 
     Some compaction strategies persist their edits into the run's durable message
     history (`SummarizingCompaction` replaces summarized prefixes for good; a
@@ -112,7 +121,13 @@ class ConversationSearch(AbstractCapability[AgentDepsT]):
         )
 
     def get_instructions(self) -> AgentInstructions[AgentDepsT] | None:
-        """Tell the model the recall tool exists, unless `add_instructions` is false."""
+        """Tell the model the recall tool exists, unless `add_instructions` is false.
+
+        The wording follows `scope` so it never describes a corpus narrower than the
+        one configured.
+        """
         if not self.add_instructions:
             return None
-        return _INSTRUCTIONS
+        if self.scope == 'conversation':
+            return _CONVERSATION_INSTRUCTIONS
+        return _ALL_INSTRUCTIONS

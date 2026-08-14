@@ -44,7 +44,7 @@ async def ask(question: str, conversation_id: str) -> str:
 ```
 
 - Ranking is BM25 (the algorithm behind Lucene/Elasticsearch), implemented in pure Python -- no new dependencies. Rare terms and exact matches score higher; multi-word queries score each word independently.
-- Reaching a past run requires both runs to carry the same `conversation_id`. `Agent.run(...)` assigns a fresh one per run when the argument is omitted, so omitting it confines a search to the calling run.
+- Reaching a past run requires both runs to share a `conversation_id`. pydantic-ai resolves one per run: an explicit `conversation_id=` wins, otherwise the most recent `conversation_id` on `message_history` is inherited, otherwise a fresh one is generated. Threading `message_history` through follow-up runs therefore keeps them in one conversation; runs sharing neither an explicit id nor a history chain are separate.
 - Results carry provenance (`run: ... | conversation: ...`), and the tool's optional `run_id` argument scopes a search to one run -- so a run referenced elsewhere (for example by a compaction receipt's transcript handle) is directly resolvable.
 - The search reads the store lazily at call time, so it always sees everything persisted so far, including earlier steps of the current run.
 
@@ -77,7 +77,9 @@ async def ask(question: str, user_id: str) -> str:
 
 The corpus is then restricted to runs whose `conversation_id` matches the calling run's, the tool's own description tells the model the restriction applies, and the tool's `run_id` argument cannot reach past it -- an out-of-scope run reports the same "no persisted history" answer as a run that does not exist.
 
-`Agent.run(...)` assigns a fresh `conversation_id` per run when the argument is omitted, so an omitted id is not an error under this scope -- it confines the search to the calling run, and earlier runs started without an explicit id count as separate conversations. Pass the same `conversation_id=` on every run that should share a corpus (it is the value `StepPersistence` records on the run).
+pydantic-ai resolves the calling run's `conversation_id` in a fixed order: the explicit `conversation_id=` argument to `Agent.run(...)`, then the most recent `conversation_id` carried on `message_history`, then a fresh UUID7. Passing `conversation_id='new'` forces a fresh one, forking a conversation off the supplied history.
+
+That order has two consequences for this scope. A follow-up run that threads `message_history` inherits the previous run's id, so it can search the runs behind it without passing the argument. A run that passes neither an explicit id nor a history chain gets an id of its own and reaches only itself -- an omitted argument is not an error here, just a narrower corpus. Neither behavior is an isolation boundary to rely on for multi-tenant separation: pass an authenticated, tenant-scoped `conversation_id=` explicitly (it is the value `StepPersistence` records on the run).
 
 A `RunContext` whose `conversation_id` is unset searches nothing under this scope and the tool says why. Matching on "conversation id is unset" would pool every unlabelled run in the store into one corpus, which is the exposure the scope exists to prevent, so it fails closed instead.
 

@@ -442,6 +442,16 @@ class TestConversationSearch:
         assert ConversationSearch(source).get_instructions() is not None
         assert ConversationSearch(source, add_instructions=False).get_instructions() is None
 
+    def test_instructions_follow_the_configured_scope(self) -> None:
+        """`all` must not inherit conversation-only wording that talks the model out of recall."""
+        source = SnapshotHistorySource(InMemoryStepStore())
+        scoped = ConversationSearch(source).get_instructions()
+        store_wide = ConversationSearch(source, scope='all').get_instructions()
+        assert isinstance(scoped, str) and isinstance(store_wide, str)
+        assert 'same conversation' in scoped
+        assert 'same store' in store_wide
+        assert 'same conversation' not in store_wide
+
 
 class TestSearchTool:
     async def test_results_carry_run_provenance(self) -> None:
@@ -567,6 +577,42 @@ class TestSearchScope:
         )
         assert 'conv-alice' not in returned
         assert 'X99881234' not in returned
+
+    async def test_conversation_scope_follows_a_message_history_chain(self) -> None:
+        """A follow-up run inherits the id from `message_history`, so it reaches the run behind it.
+
+        Pins the resolution order the docs describe: explicit argument, then the most recent
+        `conversation_id` on `message_history`, then a fresh id. Without the inherited id the
+        follow-up would be its own conversation and recall nothing.
+        """
+        store = InMemoryStepStore()
+        capabilities = [StepPersistence(store=store), ConversationSearch(SnapshotHistorySource(store))]
+        writer = Agent(TestModel(), capabilities=capabilities)
+        first = await writer.run('the ZEBRA passphrase is secret')
+
+        def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            if any(part.part_kind == 'tool-return' for part in messages[-1].parts):
+                return ModelResponse(parts=[TextPart('done')])
+            return ModelResponse(parts=[ToolCallPart('search_conversation_history', {'query': 'ZEBRA'})])
+
+        reader = Agent(FunctionModel(model_fn), capabilities=capabilities)
+        threaded = await reader.run('find it', message_history=first.all_messages())
+        returned = [
+            str(part.content)
+            for message in threaded.all_messages()
+            for part in message.parts
+            if isinstance(part, ToolReturnPart) and part.tool_name == 'search_conversation_history'
+        ]
+        assert any('ZEBRA' in rendered for rendered in returned)
+
+        detached = await reader.run('find it')
+        detached_returned = next(
+            str(part.content)
+            for message in detached.all_messages()
+            for part in message.parts
+            if isinstance(part, ToolReturnPart) and part.tool_name == 'search_conversation_history'
+        )
+        assert 'ZEBRA' not in detached_returned
 
     def test_scope_default_is_conversation(self) -> None:
         assert ConversationSearch(SnapshotHistorySource(InMemoryStepStore())).scope == 'conversation'

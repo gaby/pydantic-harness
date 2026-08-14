@@ -367,9 +367,9 @@ class ConversationSearchToolset(FunctionToolset[AgentDepsT]):
                 # It reveals nothing about whether other conversations exist in the store.
                 return (
                     'No persisted history in this conversation yet. Search covers only runs '
-                    "sharing this run's conversation id, and `Agent.run(...)` assigns a fresh "
-                    'one per run unless `conversation_id=` is passed, so earlier runs started '
-                    'without it belong to other conversations.'
+                    "sharing this run's conversation id, which comes from an explicit "
+                    '`conversation_id=` argument or is inherited from `message_history`; runs '
+                    'started with neither belong to other conversations.'
                 )
             return (
                 'No persisted conversation history to search yet. History accumulates '
