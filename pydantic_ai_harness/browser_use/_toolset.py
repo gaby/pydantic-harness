@@ -36,37 +36,113 @@ _LOCAL_FILE_PATTERNS = ['file://*']
 _LOCALHOST_PATTERNS = ['localhost', 'localhost.*', '*.localhost']
 _LOCALHOST_HOSTS = ('localhost', 'localhost.example', 'example.localhost')
 
+_HTTP_SCHEME_GLOB = 'http*'
+
+_FILE_SCHEME_ALLOWLIST_ERROR = (
+    'An `allowed_domains` entry that permits only `file://` URLs is not supported; '
+    'local file navigation is always prohibited.'
+)
+
 # Teardown runs shielded from cancellation, so an unresponsive browser could otherwise hang the
 # caller forever on exit. Bound it instead: a browser that will not close within this window is
 # retained for a later cleanup attempt, which is strictly better than wedging the run.
 _TEARDOWN_TIMEOUT = 30
 
 
-def _is_localhost_hostname(hostname: str) -> bool:  # pragma: no cover
-    """Recognize the hostname forms covered by the capability's localhost block."""
-    return hostname == 'localhost' or hostname.startswith('localhost.') or hostname.endswith('.localhost')
+def _restrict_to_http_schemes(domain: str) -> list[str]:
+    """Scheme-qualify a host-only allowlist entry so it cannot admit a `file://` URL."""
+    restricted = [f'{_HTTP_SCHEME_GLOB}://{domain}']
+    if '*' not in domain and domain.count('.') == 1:
+        restricted.append(f'{_HTTP_SCHEME_GLOB}://www.{domain}')
+    return restricted
+
+
+def _normalize_allowed_domain(domain: str) -> list[str]:
+    """Make an allowlist entry safe for browser-use's URL matching.
+
+    browser-use consults `allowed_domains` or `prohibited_domains`, never both:
+    a non-empty allowlist short-circuits the prohibition list entirely. A host-only
+    entry matches on hostname regardless of scheme, so it would admit
+    `file://<host>/...` and override the local-file prohibition. Qualifying such an
+    entry to `http`/`https` keeps the caller's intent (including a local dev server
+    on `http://localhost`) while leaving the file scheme unreachable.
+
+    Entries already scoped to a scheme are left alone unless that scheme admits `file`:
+    a scheme glob is narrowed to whichever of `http`/`https` it already matched, and an
+    entry naming `file` alone is dropped. Narrowing emits the matched schemes explicitly
+    rather than a single `http*`, because a glob can admit `file` and only one of the two
+    (`????` matches `http` but not `https`), and widening to both would newly permit a
+    scheme the caller never allowed. browser-use restricts bare `*.example.com` patterns
+    to `http`/`https` itself, so those need no qualification.
+    """
+    if '://' in domain:
+        scheme, rest = domain.split('://', maxsplit=1)
+        if fnmatch('file', scheme.lower()):
+            return [f'{matched}://{rest}' for matched in ('http', 'https') if fnmatch(matched, scheme.lower())]
+        parsed = urlsplit(domain)
+        if (
+            parsed.scheme in ('http', 'https')
+            and parsed.netloc
+            and not parsed.path
+            and not parsed.query
+            and not parsed.fragment
+            and '*' not in domain
+        ):
+            return [f'{domain}/*']
+        return [domain]
+    if domain.startswith('*.'):
+        return [domain]
+    return _restrict_to_http_schemes(domain)
+
+
+def _normalize_allowed_domains(allowed_domains: list[str]) -> list[str]:
+    """Normalize a capability-level allowlist, rejecting one that permits only `file://`."""
+    normalized = [entry for domain in allowed_domains for entry in _normalize_allowed_domain(domain)]
+    if allowed_domains and not normalized:
+        raise ValueError(_FILE_SCHEME_ALLOWLIST_ERROR)
+    return normalized
+
+
+def _normalize_profile_allowed_domains(
+    allowed_domains: list[str] | set[str] | None,
+) -> list[str] | set[str] | None:
+    """Normalize a browser profile's allowed domains without losing set semantics."""
+    if allowed_domains is None:
+        return None
+    normalized: list[str] = [entry for domain in allowed_domains for entry in _normalize_allowed_domain(domain)]
+    if allowed_domains and not normalized:
+        raise ValueError(_FILE_SCHEME_ALLOWLIST_ERROR)
+    return set(normalized) if isinstance(allowed_domains, set) else normalized
+
+
+def _glob_hostname(pattern: str) -> str:
+    """The hostname of an allowlist pattern, read as an fnmatch glob rather than a URL.
+
+    `urlsplit` cannot be used here: it rejects a leading character class such as
+    `[ab]*.example.com` as a malformed IPv6 literal, and it will not parse a glob
+    scheme like `http*://`. The authority is split by hand instead. A trailing
+    `:port` is dropped only when the colon falls outside a bracketed IPv6 literal,
+    so `[::1]` keeps its address while `localhost:*` loses its port glob.
+    """
+    authority = pattern.split('://', maxsplit=1)[-1].split('/', maxsplit=1)[0]
+    authority = authority.rpartition('@')[2]
+    host, separator, port = authority.rpartition(':')
+    if separator and ']' not in port:
+        authority = host
+    return authority.lower()
 
 
 def _pattern_allows_localhost(pattern: str) -> bool:
     """Whether a browser-use allowlist pattern would permit a localhost URL.
 
-    `BrowserUse` normalizes an allowlist before it reaches here, so every entry is
-    either scheme-qualified or a `*.`-prefixed domain glob. The remaining branches
-    cover a `BrowserUseToolset` built directly, which skips that normalization.
+    Every allowlist reaching here is normalized first, so an entry is either
+    scheme-qualified or a `*.`-prefixed domain glob.
     """
-    if '://' in pattern:
-        # A scheme-qualified entry may carry a glob scheme (`http*://`) that `urlsplit`
-        # will not parse, so read the host under a placeholder scheme instead.
-        hostname = urlsplit(f'scheme://{pattern.split("://", maxsplit=1)[1]}').hostname
-        if hostname is None:  # pragma: no cover
-            return True
-        return any(fnmatch(host, hostname.lower()) for host in _LOCALHOST_HOSTS)
-    if '*' in pattern:
-        if pattern.startswith('*.'):
-            domain = pattern[2:]
-            return any(host == domain or host.endswith(f'.{domain}') for host in _LOCALHOST_HOSTS)
-        return any(fnmatch(host, pattern) for host in _LOCALHOST_HOSTS)  # pragma: no cover
-    return _is_localhost_hostname(pattern.lower())  # pragma: no cover
+    if pattern.startswith('*.'):
+        domain = pattern[2:]
+        return any(host == domain or host.endswith(f'.{domain}') for host in _LOCALHOST_HOSTS)
+    hostname = _glob_hostname(pattern)
+    return any(fnmatch(host, hostname) for host in _LOCALHOST_HOSTS)
 
 
 @overload
@@ -386,13 +462,24 @@ class BrowserUseToolset(FunctionToolset[AgentDepsT]):
         if headless is None and self._browser_profile is None:
             headless = True
         browser_profile = self._browser_profile
-        allowed_domains = self._allowed_domains
+        # Normalization also runs in `BrowserUse.__post_init__`, which reports a bad
+        # allowlist at construction. Repeating it here covers a `BrowserUseToolset`
+        # built directly, which skips the capability entirely; the transform is
+        # idempotent, so the capability path is unaffected.
+        allowed_domains = None if self._allowed_domains is None else _normalize_allowed_domains(self._allowed_domains)
         if browser_profile is None:
             browser_profile = BrowserProfile(prohibited_domains=_LOCAL_FILE_PATTERNS)
         else:
             prohibited_domains = list(browser_profile.prohibited_domains or ())
             prohibited_domains.extend(pattern for pattern in _LOCAL_FILE_PATTERNS if pattern not in prohibited_domains)
             browser_profile = browser_profile.model_copy(update={'prohibited_domains': prohibited_domains})
+        # `BrowserSession` lets a non-`None` `allowed_domains` replace the profile's own
+        # list, so the profile allowlist only reaches the navigation guard when the
+        # direct one is absent.
+        if allowed_domains is None and browser_profile.allowed_domains is not None:
+            browser_profile = browser_profile.model_copy(
+                update={'allowed_domains': _normalize_profile_allowed_domains(browser_profile.allowed_domains)}
+            )
         if self._sensitive_data is not None:
             browser_profile = browser_profile.model_copy(update={'cross_origin_iframes': False})
         if self._block_ip_addresses:

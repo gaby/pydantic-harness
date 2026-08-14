@@ -8,7 +8,6 @@ import logging
 from collections.abc import Awaitable
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Literal, TypeVar, overload
 
 import anyio
@@ -20,6 +19,8 @@ import pytest
 from browser_use.agent.service import Agent as BrowserUseAgent
 from browser_use.agent.service import Tools  # pyright: ignore[reportPrivateImportUsage]
 from browser_use.browser import BrowserProfile, BrowserSession
+from browser_use.browser.events import NavigateToUrlEvent
+from browser_use.browser.session import ResilientEventBus
 from browser_use.browser.watchdogs.security_watchdog import SecurityWatchdog
 from browser_use.llm.messages import BaseMessage
 from browser_use.llm.views import ChatInvokeCompletion
@@ -1323,14 +1324,31 @@ class TestLocalFileNavigation:
     """
 
     @staticmethod
-    def _navigation_allowed(profile: BrowserProfile, url: str) -> bool:
-        watchdog = SecurityWatchdog.__new__(SecurityWatchdog)
-        session = SimpleNamespace(browser_profile=profile, logger=logging.getLogger('test'))
-        object.__setattr__(watchdog, 'browser_session', session)
-        return watchdog._is_url_allowed(url)  # pyright: ignore[reportPrivateUsage]
+    async def _navigation_allowed(session: BrowserSession, url: str) -> bool:
+        """Whether browser-use's own security watchdog admits `url` for `session`.
+
+        `on_NavigateToUrlEvent` is the supported entry point the guard exposes: it is
+        the handler browser-use dispatches before every navigation, it raises when the
+        URL is refused, and it returns without touching CDP when the URL is allowed.
+
+        The watchdog gets its own bus rather than the session's: a refusal dispatches a
+        `BrowserErrorEvent`, and the session's bus is already stopped by the time the
+        toolset hands the session back, so reviving it would leave the loop with a
+        running bus at teardown.
+        """
+        event_bus = ResilientEventBus()
+        watchdog = SecurityWatchdog(event_bus=event_bus, browser_session=session)
+        try:
+            await watchdog.on_NavigateToUrlEvent(NavigateToUrlEvent(url=url))
+        except ValueError:
+            return False
+        else:
+            return True
+        finally:
+            await event_bus.stop(clear=True, timeout=5)
 
     @staticmethod
-    async def _resolved_profile(allowed_domains: list[str] | None, block_ip_addresses: bool) -> BrowserProfile:
+    async def _resolved_session(allowed_domains: list[str] | None, block_ip_addresses: bool) -> BrowserSession:
         factory = _success_factory()
         await (
             BrowserUse[None](
@@ -1341,7 +1359,7 @@ class TestLocalFileNavigation:
             .get_toolset()
             .browse_web('task')
         )
-        return factory.requests[0].browser_session.browser_profile
+        return factory.requests[0].browser_session
 
     @pytest.mark.parametrize(
         ('allowed_domains', 'block_ip_addresses'),
@@ -1369,8 +1387,8 @@ class TestLocalFileNavigation:
     async def test_file_urls_are_unreachable(
         self, allowed_domains: list[str] | None, block_ip_addresses: bool, url: str
     ) -> None:
-        profile = await self._resolved_profile(allowed_domains, block_ip_addresses)
-        assert self._navigation_allowed(profile, url) is False
+        session = await self._resolved_session(allowed_domains, block_ip_addresses)
+        assert await self._navigation_allowed(session, url) is False
 
     @pytest.mark.parametrize(
         ('allowed_domains', 'block_ip_addresses', 'url'),
@@ -1386,8 +1404,8 @@ class TestLocalFileNavigation:
     async def test_http_navigation_survives_the_file_restriction(
         self, allowed_domains: list[str], block_ip_addresses: bool, url: str
     ) -> None:
-        profile = await self._resolved_profile(allowed_domains, block_ip_addresses)
-        assert self._navigation_allowed(profile, url) is True
+        session = await self._resolved_session(allowed_domains, block_ip_addresses)
+        assert await self._navigation_allowed(session, url) is True
 
     def test_an_allowlist_of_only_file_urls_is_rejected(self) -> None:
         with pytest.raises(ValueError, match='permits only `file://` URLs'):
@@ -1396,3 +1414,59 @@ class TestLocalFileNavigation:
     def test_a_profile_allowlist_of_only_file_urls_is_rejected(self) -> None:
         with pytest.raises(ValueError, match='permits only `file://` URLs'):
             BrowserUse[None](browser_profile=BrowserProfile(allowed_domains=['file://*']))
+
+    def test_an_overridden_profile_allowlist_is_not_validated(self) -> None:
+        """`allowed_domains` replaces the profile's list, so the unused one is not rejected."""
+        capability = BrowserUse[None](
+            allowed_domains=['example.com'],
+            browser_profile=BrowserProfile(allowed_domains=['file://*']),
+        )
+        assert capability.allowed_domains == ['http*://example.com', 'http*://www.example.com']
+
+    @pytest.mark.parametrize(
+        ('allowed_domains', 'block_ip_addresses'),
+        [
+            (['*'], False),
+            (['localhost'], False),
+            (['*://localhost:*/*'], False),
+            (['file://*', 'example.com'], True),
+        ],
+    )
+    @pytest.mark.parametrize('url', ['file://localhost/etc/passwd', 'file://LOCALHOST/etc/passwd'])
+    async def test_a_directly_built_toolset_also_blocks_file_urls(
+        self, allowed_domains: list[str], block_ip_addresses: bool, url: str
+    ) -> None:
+        """`BrowserUseToolset` normalizes too, so it does not depend on the capability."""
+        factory = _success_factory()
+        toolset = BrowserUseToolset[None](
+            browser_agent=factory,
+            llm=None,
+            browser_profile=None,
+            allowed_domains=allowed_domains,
+            block_ip_addresses=block_ip_addresses,
+            headless=None,
+            max_steps=10,
+            use_vision='auto',
+            output_schema=None,
+            sensitive_data=None,
+            extend_system_message=None,
+            settings=BrowserAgentSettings(),
+            session_scope='call',
+            cdp_url=None,
+        )
+        await toolset.browse_web('task')
+        session = factory.requests[0].browser_session
+        assert await self._navigation_allowed(session, url) is False
+
+    async def test_a_bracket_host_glob_does_not_fail_as_an_ipv6_literal(self) -> None:
+        """A leading character class is an fnmatch glob, not a malformed IPv6 authority."""
+        session = await self._resolved_session(['[ab]*.example.com'], True)
+        assert await self._navigation_allowed(session, 'file://localhost/etc/passwd') is False
+        assert await self._navigation_allowed(session, 'https://ab.example.com/') is True
+
+    async def test_narrowing_a_scheme_glob_keeps_only_the_schemes_it_matched(self) -> None:
+        """`????` admits `http` and `file` but not `https`, so `https` stays out."""
+        session = await self._resolved_session(['????://intranet.example/*'], True)
+        assert await self._navigation_allowed(session, 'file://intranet.example/etc/passwd') is False
+        assert await self._navigation_allowed(session, 'http://intranet.example/x') is True
+        assert await self._navigation_allowed(session, 'https://intranet.example/x') is False

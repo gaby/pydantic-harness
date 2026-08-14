@@ -200,7 +200,10 @@ origin.
   `'https://example.com'` is given a path boundary before browser-use matches
   it, so it does not match `https://example.com.attacker.test`. A host-only
   entry (`'example.com'`, `'localhost'`, `'*'`) is qualified to `http`/`https`
-  first, so an allowlist cannot re-admit `file://` (see **File actions**).
+  first, so an allowlist cannot re-admit `file://` (see **File actions**). An
+  entry whose scheme is a glob keeps only the schemes it already matched, so
+  narrowing it never admits one the caller had excluded. The same normalization
+  runs in `BrowserUseToolset`, so constructing the toolset directly gets it too.
 - **Private networks.** `block_ip_addresses=True` by default blocks direct IP
   addresses and common localhost hostnames, including when a profile has an
   allowlist. Set it to `False` only when a task must reach an internal service.
