@@ -78,7 +78,8 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
 
     Security model:
     - All paths resolved relative to root with canonical path checks
-    - Symlinks resolved before authorization (prevents TOCTTOU)
+    - Symlinks resolved before authorization, so one pointing outside the root at
+      resolve time is rejected rather than followed
     - Glob-based allow/deny filtering
     - Protected path patterns (e.g. `.git/`, `.env`)
     - Binary file detection blocks text operations
