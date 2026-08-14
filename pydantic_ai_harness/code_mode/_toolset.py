@@ -9,6 +9,7 @@ import warnings
 from collections.abc import Callable, Coroutine, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
+from itertools import islice
 from typing import Annotated, Any, Literal
 
 from pydantic import Field, TypeAdapter
@@ -160,7 +161,7 @@ def _preview(value: Any, *, nested: bool = False) -> str:
     if isinstance(value, dict):
         if nested:
             return f'{{{len(raw)} items}}'
-        pairs = list(raw.items())[:items]
+        pairs = islice(raw.items(), items)
         rendered = ', '.join(f'{_preview(k, nested=True)}: {_preview(v, nested=True)}' for k, v in pairs)
         return '{' + rendered + '}' + _elided(len(raw), items, 'items')
     if value is None or isinstance(value, (int, float)):
