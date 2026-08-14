@@ -69,6 +69,22 @@ _RETRY_VALUE_PREVIEW_CHARS = 120
 _RETRY_SUMMARY_MAX_CHARS = 2000
 
 
+def _is_duration_exhausted(error: MontyRuntimeError) -> bool:
+    """Whether this runtime error is Monty's spent `max_duration_secs` allowance.
+
+    Monty reports it as a `TimeoutError` carried inside `MontyRuntimeError`, with no typed marker
+    or attribute to test, so its rendered text is the only signal available
+    (`'TimeoutError: time limit exceeded: 300.000045ms > 300ms'`). Matching another package's
+    wording is brittle, so it is confined to this function: a Monty reword is one edit here, and
+    `test_duration_exhaustion_points_at_restart` drives a real exhausted session rather than a
+    fixed string, so a reword fails that test instead of silently dropping the hint.
+
+    Callers must read `False` as "add nothing", not as "not a timeout". A miss leaves the ordinary
+    runtime-error message intact, which is the behaviour that shipped before the hint existed.
+    """
+    return 'time limit exceeded' in error.display(format='type-msg')
+
+
 def _preview(value: object) -> str:
     """Render a value for an error message, bounded so one large payload cannot flood the prompt."""
     text = repr(value)
@@ -78,11 +94,15 @@ def _preview(value: object) -> str:
 
 
 def _describe_started_calls(calls: dict[str, ToolCallPart], returns: dict[str, ToolReturnPart]) -> str:
-    """Summarize every nested call that started, with what became of each.
+    """Report how many nested calls started, with per-call detail inside a size cap.
 
     Keyed off `calls` rather than `returns` because a call that raised has no recorded return, and
     a tool can commit a side effect before raising. Those are the calls most likely to have left
-    partial state, so omitting them would hide exactly what the model needs to check.
+    partial state, so omitting them by kind would hide exactly what the model needs to check.
+
+    The per-call lines are bounded, so a long run drops the tail and says how many it dropped. The
+    total is always exact: it is the part that survives truncation, and it is what tells the model
+    the list it can see is incomplete.
     """
     lines: list[str] = []
     used = 0
@@ -103,7 +123,7 @@ def _describe_started_calls(calls: dict[str, ToolCallPart], returns: dict[str, T
     return (
         f'{len(calls)} nested tool calls started before the limit was reached:\n'
         + '\n'.join(lines)
-        + '\nTake these into account before retrying so completed work is not repeated.'
+        + f'\nAccount for all {len(calls)} before retrying; repeating a call repeats whatever it already did.'
     )
 
 
@@ -783,6 +803,17 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
                 # calls already started. Without them the model reruns their side effects when
                 # it retries with a smaller batch.
                 message += f'\n\n{_describe_started_calls(nested_calls, nested_returns)}'
+            elif _is_duration_exhausted(e):
+                # This error keeps the session, so every later call fails on arrival too. Left
+                # alone it reads like an ordinary runtime error, which points the model at
+                # rewriting the snippet -- the one move that cannot work.
+                message += (
+                    '\n\nThe sandbox session has spent its whole `max_duration_secs` allowance, '
+                    'which every `run_code` call in the session shares, so later calls fail on '
+                    'arrival too and revising this code will not help. Pass `restart: true` to '
+                    'start a fresh session; that discards REPL state, so recreate anything you '
+                    'still need.'
+                )
             raise ModelRetry(message) from e
         except MontyCrashedError as e:
             # The worker died mid-feed (e.g. the code exhausted its memory or hit the

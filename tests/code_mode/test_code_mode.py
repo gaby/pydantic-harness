@@ -628,6 +628,49 @@ class TestCodeMode:
         for value in (0, 1, 2):
             assert f"record({{'value': {value}}}) returned {value}" in message
 
+    async def test_duration_exhaustion_points_at_restart(self) -> None:
+        """A spent duration allowance tells the model to restart, not to rewrite the snippet.
+
+        The allowance is per session and this error keeps the session, so every later call fails
+        on arrival; only `restart: true` recovers it. Detection matches Monty's rendered timeout
+        text, so this drives a real exhausted session rather than a fixed string: if Monty rewords
+        the message, this test fails instead of the hint quietly disappearing.
+        """
+        wrapper = CodeMode[object](resource_limits={'max_duration_secs': 0.3}).get_wrapper_toolset(
+            _build_function_toolset(add)
+        )
+        assert isinstance(wrapper, CodeModeToolset)
+        ctx = await build_ctx(None, wrapper)
+        tools = await wrapper.get_tools(ctx)
+        spend_it = 'y = 0\nfor i in range(100_000_000):\n    y += i\ny'
+
+        with pytest.raises(ModelRetry) as exc_info:
+            await wrapper.call_tool('run_code', {'code': spend_it}, ctx, tools['run_code'])
+        assert '`restart: true`' in exc_info.value.message
+
+        # The session is kept, so a later trivial snippet fails on arrival and needs the same hint.
+        with pytest.raises(ModelRetry) as later:
+            await wrapper.call_tool('run_code', {'code': '1 + 1'}, ctx, tools['run_code'])
+        assert '`restart: true`' in later.value.message
+
+        # And restarting really does clear it, which is what the hint promises.
+        result = await wrapper.call_tool('run_code', {'code': '1 + 1', 'restart': True}, ctx, tools['run_code'])
+        assert result.return_value == 2
+
+    async def test_ordinary_runtime_error_does_not_mention_restart(self) -> None:
+        """A plain exception keeps the message it always had; the hint is not bolted onto everything."""
+        wrapper = CodeMode[object]().get_wrapper_toolset(_build_function_toolset(add))
+        assert isinstance(wrapper, CodeModeToolset)
+        ctx = await build_ctx(None, wrapper)
+        tools = await wrapper.get_tools(ctx)
+
+        with pytest.raises(ModelRetry) as exc_info:
+            await wrapper.call_tool('run_code', {'code': 'raise ValueError("boom")'}, ctx, tools['run_code'])
+
+        message = exc_info.value.message
+        assert 'boom' in message
+        assert 'restart' not in message
+
     async def test_budget_retry_names_calls_that_raised(self) -> None:
         """A call that raised is listed too, since a tool can apply a change before failing.
 
@@ -738,6 +781,10 @@ class TestCodeMode:
         assert len(message) < 5_000, f'summary grew to {len(message)} chars'
         assert 'chars total)' in message
         assert 'more not shown' in message
+        # The count is the part that survives truncation, so it has to stay exact: it is what
+        # tells the model the visible list is incomplete.
+        assert '30 nested tool calls started before the limit was reached' in message
+        assert 'Account for all 30 before retrying' in message
 
     async def test_exhausted_budget_on_sequential_tool_preserves_completed_calls(self) -> None:
         """The budget refusal reaches the sandbox for inline-resolved tools too.

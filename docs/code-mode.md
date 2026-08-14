@@ -179,19 +179,28 @@ sandbox session, so consecutive `run_code` calls draw down one shared allowance 
 starts with a full one. Sessions are replaced by `restart: true` and by the failures that reset the
 REPL: a worker crash, a type error, a host-side failure, and a syntax error before any code has run.
 Each of those renews the allowance without the model asking for a restart. An ordinary exception
-inside a snippet is not one of them, so once an allowance is spent, `run_code` keeps returning a
-model retry reporting the timeout until one of those resets happens.
+inside a snippet is not one of them.
+
+Once a session's allowance is spent, every later `run_code` call fails on arrival, including
+snippets that would cost almost nothing, because they reuse the same session. Rewriting the code
+does not help. `restart: true` is what recovers it, at the cost of the REPL state that session was
+holding, so any variables, imports, and definitions have to be recreated. `run_code` says as much
+in the retry it returns, but the behaviour is worth knowing when choosing `max_duration_secs`: set
+it low and a long agent run will spend it on ordinary work and pay a restart to continue.
 
 Nested tool calls are bounded separately by `max_tool_calls`, which defaults to 100 per `run_code`
 call. The budget is reserved before each call is scheduled, so a snippet cannot dispatch more work
 than it allows. A call past the budget fails at its call site inside the sandbox. A snippet that
 catches the error keeps the results of the calls that already completed and can return them. A
-snippet that lets it propagate gets a model retry listing every nested call that started and what
-became of each: returned, raised, or denied. Calls that raised are listed too, since a tool can
-apply a change before failing. The list is context for the model, not a guard: nothing stops it
-from calling those tools again, so treat it as informing the next attempt rather than preventing a
-repeat. Arguments and results are previewed rather than quoted in full, so a large payload cannot
-inflate the retry.
+snippet that lets it propagate gets a model retry reporting how many nested calls started,
+followed by per-call detail: what each was called with, and whether it returned, raised, or was
+denied. Calls that raised are included rather than filtered out, since a tool can apply a change
+before failing. That detail is bounded -- arguments and results are previewed, and the list stops
+at a size cap and says how many entries it left out -- so a large payload cannot inflate the
+retry. The reported total stays exact whether or not the list was cut, which is what tells the
+model some calls are missing from what it can see. The list is context for the model, not a guard:
+nothing stops it from calling those tools again, so treat it as informing the next attempt rather
+than preventing a repeat.
 
 Override them with `resource_limits={'max_duration_secs': 10, 'max_memory': 134_217_728}` and
 `max_tool_calls=25`. Pass `resource_limits='unlimited'` only when another execution boundary
