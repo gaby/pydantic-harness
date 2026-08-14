@@ -52,6 +52,7 @@ except ImportError as _import_error:  # pragma: no cover
         'pydantic-monty is required for CodeMode. Install it with: pip install "pydantic-ai-harness[code-mode]"'
     ) from _import_error
 from pydantic_ai_harness._monty_exec import MontyExecutor, PrintCapture, is_sandbox_panic
+from pydantic_ai_harness._warn import HarnessConfigurationWarning
 
 # A raw OS callback. Return `pydantic_monty.NOT_HANDLED` to defer the call to the
 # sandbox's default, which leaves it unavailable.
@@ -81,6 +82,20 @@ _SANDBOX_LIMIT_MARKERS = {
     'max_duration_secs': 'time limit exceeded',
     'max_memory': 'memory limit exceeded',
 }
+
+
+def _in_temporal_workflow() -> bool:
+    """Whether this is running inside Temporal workflow code.
+
+    `run_code` runs workflow-side under `TemporalDurability` and its snippets are re-executed
+    during replay, so an elapsed-time decision made here is re-measured rather than replayed from
+    history. Fails safe: no `temporalio` means no workflow, so the caller keeps enforcing.
+    """
+    try:
+        from temporalio import workflow
+    except ImportError:
+        return False
+    return workflow.in_workflow()
 
 
 def _exhausted_sandbox_limit(error: MontyRuntimeError) -> str | None:
@@ -545,6 +560,10 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
     # `get_instructions` in the same step. Empty when there's nothing to surface.
     _last_catalog: str = field(default='', init=False, repr=False)
 
+    # Set once the elapsed-time cap has been reported as unenforced, so a long run warns per
+    # capability rather than per `run_code` call.
+    _warned_unenforced_duration: bool = field(default=False, init=False, repr=False, compare=False)
+
     # Tracks deferred-tool names we've already warned about so we don't spam the
     # logs every step. Reset on `for_run` because each run gets a fresh instance.
     _warned_deferred: set[str] = field(default_factory=set[str], init=False, repr=False)
@@ -565,13 +584,47 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
         new_self._last_catalog = self._last_catalog
         return new_self
 
+    def _session_limits(self) -> ResourceLimits:
+        """Resolve the limits for a session checkout, dropping what replay cannot reproduce.
+
+        `run_code` runs in workflow code under `TemporalDurability` and its snippets are
+        re-executed on replay, so an elapsed-time cap is re-measured instead of replayed from
+        history. A snippet near the threshold can pass originally and trip on replay, which
+        changes whether a retry happens, which changes the activities the workflow schedules.
+        The cap is therefore not enforced there.
+
+        `max_memory` and `max_tool_calls` stay: a snippet allocates the same on replay, and the
+        call budget is a function of the snippet rather than of the machine, so neither moves the
+        decision. Dropping them would give up protection for nothing.
+        """
+        limits = _resolve_resource_limits(self.resource_limits)
+        if _in_temporal_workflow():
+            limits.pop('max_duration_secs', None)
+        return limits
+
     async def __aenter__(self) -> Self:
         """Enter the wrapped toolset and prepare lazy Monty resources for this run."""
         # Reject misconfiguration when the run starts rather than at the first `run_code` call,
         # which may be many model steps later. The resolved value is recomputed at checkout.
-        _resolve_resource_limits(self.resource_limits)
+        resolved = _resolve_resource_limits(self.resource_limits)
         if self.max_tool_calls < 1:
             raise UserError('`max_tool_calls` must be at least 1')
+        # Reported here rather than from `_session_limits`, which runs inside the handler that
+        # converts exceptions into retries: a caller running with warnings as errors would have
+        # turned this into a `ModelRetry`, perturbing the very history it warns about.
+        if resolved.get('max_duration_secs') is not None and _in_temporal_workflow():
+            if not self._warned_unenforced_duration:
+                self._warned_unenforced_duration = True
+                warnings.warn(
+                    'CodeMode is not enforcing `max_duration_secs` because `run_code` runs in '
+                    'Temporal workflow code, where snippets are re-executed during replay. '
+                    'Measuring elapsed time there would let the same snippet pass on one execution '
+                    'and time out on another, changing the workflow history. Bound long-running '
+                    'sandbox loops in the snippets themselves; `max_memory` and `max_tool_calls` '
+                    'still apply.',
+                    category=HarnessConfigurationWarning,
+                    stacklevel=2,
+                )
         run_state = _MontyRunState()
         await self.wrapped.__aenter__()
         self._run_state = run_state
@@ -835,7 +888,7 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
             session = run_state.get_session(
                 type_check=type_check,
                 type_check_stubs=type_check_stubs,
-                limits=_resolve_resource_limits(self.resource_limits),
+                limits=self._session_limits(),
             )
             try:
                 monty_state = session.feed_start(

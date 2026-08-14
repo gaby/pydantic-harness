@@ -161,7 +161,13 @@ code_mode_agent = Agent(
     FunctionModel(_code_mode_model),
     name='code_mode_temporal_agent',
     toolsets=[FunctionToolset(tools=[add], id='math')],
-    capabilities=[CodeMode(), TemporalDurability(activity_config=BASE_ACTIVITY_CONFIG)],
+    # `resource_limits='unlimited'` states what is true under Temporal rather than relying on it:
+    # `run_code` runs in workflow code, so the elapsed-time cap is not enforced there and CodeMode
+    # reports that it is dropping it. Declaring it here keeps this test about workflow execution.
+    capabilities=[
+        CodeMode(resource_limits='unlimited'),
+        TemporalDurability(activity_config=BASE_ACTIVITY_CONFIG),
+    ],
 )
 
 

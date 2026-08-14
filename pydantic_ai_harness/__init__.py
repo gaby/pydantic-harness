@@ -2,7 +2,7 @@
 
 from typing import TYPE_CHECKING
 
-from ._warn import HarnessDeprecationWarning
+from ._warn import HarnessConfigurationWarning, HarnessDeprecationWarning
 
 if TYPE_CHECKING:
     from .code_mode import CodeMode
@@ -25,6 +25,7 @@ __all__ = [
     'FileSystem',
     'GuardrailError',
     'GuardrailResult',
+    'HarnessConfigurationWarning',
     'HarnessDeprecationWarning',
     'InputBlocked',
     'InputGuardrail',

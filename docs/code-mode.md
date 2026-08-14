@@ -170,13 +170,24 @@ Reserve `print()` for supplementary logging: printed text is surfaced separately
 Printed output is limited to 10 MiB. Exceeding the limit makes `run_code` return a model retry.
 
 Sandbox execution is bounded by `resource_limits`, which defaults to 30 seconds of execution time
-and a 256 MiB heap. What this guarantees is a per-snippet ceiling: no single `run_code` snippet runs
-longer than `max_duration_secs` of sandbox time, which is what stops a runaway loop. Time spent
-awaiting a nested tool is excluded from that timer.
+and a 256 MiB heap. Outside a durable workflow, `max_duration_secs` gives a per-snippet ceiling: no
+single `run_code` snippet runs longer than that much sandbox time, which is what stops a runaway
+loop. Time spent awaiting a nested tool is excluded from that timer.
 
-It is not a run-wide CPU budget, and it cannot be relied on as one. Monty applies the limits per
-sandbox session, so consecutive `run_code` calls draw down one shared allowance and each new session
-starts with a full one. Sessions are replaced by `restart: true` and by the failures that reset the
+Under `TemporalDurability` that ceiling does not apply. `run_code` runs in workflow code and its
+snippets are re-executed during replay, so an elapsed-time decision would be measured again rather
+than replayed from history: the same snippet could finish on the original worker and time out under
+replay load, changing whether a retry happened and so which activities the workflow scheduled.
+`CodeMode` therefore stops enforcing `max_duration_secs` in workflow code and warns once with
+`HarnessConfigurationWarning` that it is doing so. **For durable agents, nothing here bounds sandbox
+CPU time**; the applicable guidance is the one below under Temporal durability, to keep sandbox
+loops bounded in the snippets themselves. `max_memory` and `max_tool_calls` are unaffected, since a
+snippet allocates the same on replay and the call budget is a function of the snippet rather than of
+the machine.
+
+Where the cap does apply, it is still not a run-wide CPU budget, and cannot be relied on as one.
+Monty applies the limits per sandbox session, so consecutive `run_code` calls draw down one shared
+allowance and each new session starts with a full one. Sessions are replaced by `restart: true` and by the failures that reset the
 REPL: a worker crash, a type error, a host-side failure, and a syntax error before any code has run.
 Each of those renews the allowance without the model asking for a restart. An ordinary exception
 inside a snippet is not one of them.
@@ -253,6 +264,19 @@ other side effects in wrapped tools so Temporal records them as activities. Repl
 changed arguments when the same activity remains at the same history position, so replay validation
 is not a substitute for this boundary. Temporal activity timeouts apply to nested tools, not pure
 computation inside `run_code`, so keep sandbox loops bounded.
+
+That guidance is what bounds sandbox CPU time here, because `resource_limits['max_duration_secs']`
+is not enforced in workflow code. Enforcing it would re-measure elapsed time on every replay, and a
+snippet near the threshold could pass once and time out the next time, changing the recorded
+history. `CodeMode` drops the cap there and warns once with `HarnessConfigurationWarning`; the
+warning names the setting so the gap between what was configured and what applies is visible rather
+than discovered later. `max_memory` and `max_tool_calls` still apply.
+
+Recording the decision instead of re-measuring it would be the real fix: if `run_code` ran inside a
+Temporal activity, its outcome would be written to history once and replayed rather than
+recomputed. That is a change to Pydantic AI core rather than to this package, since
+`TemporalDurability` decides what becomes an activity, and it has to contend with the REPL being
+process-local to one agent run, which is why `run_code` is workflow-side today.
 
 ## Observability
 

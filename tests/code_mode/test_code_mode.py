@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import sys
+import warnings
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, Literal, TypeVar
@@ -34,7 +36,7 @@ from pydantic_core import SchemaValidator, core_schema
 from pydantic_monty import NOT_HANDLED, Monty, MountDir, OSAccess, OsFunction
 from typing_extensions import Never, TypedDict
 
-from pydantic_ai_harness import CodeMode
+from pydantic_ai_harness import CodeMode, HarnessConfigurationWarning
 from pydantic_ai_harness.code_mode import CodeModeResourceLimits, CodeModeToolset
 from pydantic_ai_harness.code_mode._toolset import (  # pyright: ignore[reportPrivateUsage]
     _SEARCH_TOOLS_MODIFIER,
@@ -823,6 +825,130 @@ class TestCodeMode:
         assert '{2 items}' in message  # nested container reported by size
         assert '[2 items]' in message  # nested list argument likewise
         assert '(50 items total)' in message  # long list cut to its first few
+
+    async def test_duration_cap_is_not_enforced_in_workflow_code(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Under Temporal the elapsed-time cap is dropped, and the divergence is reported.
+
+        Snippets are re-executed during replay, so a re-measured timeout could pass on one
+        execution and trip on another, changing the workflow history. Silence would be worse than
+        the cap: the caller configured a limit that is not being applied.
+        """
+        import temporalio.workflow
+
+        monkeypatch.setattr(temporalio.workflow, 'in_workflow', lambda: True)
+
+        wrapper = CodeMode[object](resource_limits={'max_duration_secs': 0.3}).get_wrapper_toolset(
+            _build_function_toolset(add)
+        )
+        assert isinstance(wrapper, CodeModeToolset)
+
+        # Reported when the run starts, not from inside `call_tool`, where warnings-as-errors
+        # would be caught and turned into a retry.
+        with pytest.warns(HarnessConfigurationWarning, match='not enforcing `max_duration_secs`'):
+            ctx = await build_ctx(None, wrapper)
+        tools = await wrapper.get_tools(ctx)
+
+        # Well past 0.3 seconds of sandbox work, and it completes, so the cap is really off.
+        spend_it = 'y = 0\nfor i in range(20_000_000):\n    y += i\ny'
+        with warnings.catch_warnings():
+            warnings.simplefilter('error', HarnessConfigurationWarning)
+            result = await wrapper.call_tool('run_code', {'code': spend_it}, ctx, tools['run_code'])
+            again = await wrapper.call_tool('run_code', {'code': spend_it}, ctx, tools['run_code'])
+        assert result.return_value == 199999990000000
+        assert again.return_value == 199999990000000
+
+    async def test_workflow_duration_report_is_once_per_capability(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An agent is reused across runs, so entering again must not repeat the report."""
+        import temporalio.workflow
+
+        monkeypatch.setattr(temporalio.workflow, 'in_workflow', lambda: True)
+
+        wrapper = CodeMode[object]().get_wrapper_toolset(_build_function_toolset(add))
+        assert isinstance(wrapper, CodeModeToolset)
+
+        with pytest.warns(HarnessConfigurationWarning, match='not enforcing `max_duration_secs`'):
+            await wrapper.__aenter__()
+        await wrapper.__aexit__(None, None, None)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter('error', HarnessConfigurationWarning)
+            await wrapper.__aenter__()
+        await wrapper.__aexit__(None, None, None)
+
+    async def test_call_and_memory_caps_still_apply_in_workflow_code(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Only the elapsed-time cap is replay-sensitive, so the other two keep working.
+
+        A snippet allocates the same on replay and the call budget is a function of the snippet,
+        so neither moves the decision and dropping them would give up protection for nothing.
+        """
+        import temporalio.workflow
+
+        monkeypatch.setattr(temporalio.workflow, 'in_workflow', lambda: True)
+
+        memory_capped = CodeMode[object](resource_limits={'max_memory': 8 * 1024 * 1024}).get_wrapper_toolset(
+            _build_function_toolset(add)
+        )
+        assert isinstance(memory_capped, CodeModeToolset)
+        # The default duration limit still counts as configured, so entering warns; this test is
+        # about the other two caps surviving.
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', HarnessConfigurationWarning)
+            ctx = await build_ctx(None, memory_capped)
+        tools = await memory_capped.get_tools(ctx)
+        with pytest.raises(ModelRetry, match='memory limit exceeded'):
+            await memory_capped.call_tool('run_code', {'code': 'x = [0] * 50_000_000\nlen(x)'}, ctx, tools['run_code'])
+
+        call_capped = CodeMode[object](max_tool_calls=2).get_wrapper_toolset(_build_function_toolset(add))
+        assert isinstance(call_capped, CodeModeToolset)
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', HarnessConfigurationWarning)
+            ctx2 = await build_ctx(None, call_capped)
+        tools2 = await call_capped.get_tools(ctx2)
+        with pytest.raises(ModelRetry, match='allows 2 nested tool calls'):
+            await call_capped.call_tool(
+                'run_code',
+                {'code': 'o = []\nfor i in range(5):\n    o.append(await add(a=i, b=1))\no'},
+                ctx2,
+                tools2['run_code'],
+            )
+
+    async def test_unlimited_in_workflow_code_warns_about_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """With no duration limit configured there is no divergence to report."""
+        import temporalio.workflow
+
+        monkeypatch.setattr(temporalio.workflow, 'in_workflow', lambda: True)
+
+        wrapper = CodeMode[object](resource_limits='unlimited').get_wrapper_toolset(_build_function_toolset(add))
+        assert isinstance(wrapper, CodeModeToolset)
+        with warnings.catch_warnings():
+            warnings.simplefilter('error', HarnessConfigurationWarning)
+            ctx = await build_ctx(None, wrapper)
+        tools = await wrapper.get_tools(ctx)
+
+        result = await wrapper.call_tool('run_code', {'code': '1 + 1'}, ctx, tools['run_code'])
+        assert result.return_value == 2
+
+    async def test_missing_temporalio_leaves_the_duration_cap_enforced(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Detection fails safe: no `temporalio` means no workflow, so the cap still applies.
+
+        An optional dependency being absent must never be what disables a limit.
+        """
+        monkeypatch.setitem(sys.modules, 'temporalio', None)
+
+        wrapper = CodeMode[object](resource_limits={'max_duration_secs': 0.3}).get_wrapper_toolset(
+            _build_function_toolset(add)
+        )
+        assert isinstance(wrapper, CodeModeToolset)
+        ctx = await build_ctx(None, wrapper)
+        tools = await wrapper.get_tools(ctx)
+
+        with pytest.raises(ModelRetry, match='time limit exceeded'):
+            await wrapper.call_tool(
+                'run_code',
+                {'code': 'y = 0\nfor i in range(100_000_000):\n    y += i\ny'},
+                ctx,
+                tools['run_code'],
+            )
 
     async def test_ordinary_runtime_error_does_not_mention_restart(self) -> None:
         """A plain exception keeps the message it always had; the hint is not bolted onto everything."""
