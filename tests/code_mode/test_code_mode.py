@@ -830,6 +830,109 @@ class TestCodeMode:
         assert '0.5' in message  # plain scalars still render
         assert '(50 items total)' in message  # long list cut to its first few
 
+    async def test_containers_render_through_the_builtin_not_the_value(self) -> None:
+        """A container subclass cannot substitute its own slice or item view into the retry.
+
+        Same failure as the scalar case, reached through a different name: `isinstance` matches
+        subclasses, so `value[:120]`, `raw[:5]` and `raw.items()` all dispatch to whatever the type
+        defines, and a `__getitem__` that ignores the slice hands back the whole payload. That
+        succeeds, so no guard catches it. Each container shape takes its own branch and each is
+        covered here, because the fix is per-expression rather than shared.
+        """
+
+        payload = 'x' * 200
+
+        class WideStr(str):
+            """A str whose slice ignores the bound."""
+
+            def __getitem__(self, key: Any) -> Any:
+                return payload * 50_000
+
+        class WideBytes(bytes):
+            """Bytes whose slice ignores the bound."""
+
+            def __getitem__(self, key: Any) -> Any:
+                return payload.encode() * 50_000
+
+        class WideList(list[str]):
+            """A list whose slice returns far more than the requested head."""
+
+            def __getitem__(self, key: Any) -> Any:
+                return [payload] * 50_000
+
+        class WideTuple(tuple[str, ...]):
+            """A tuple whose slice returns far more than the requested head."""
+
+            def __getitem__(self, key: Any) -> Any:
+                return (payload,) * 50_000
+
+        class WideDict(dict[str, str]):
+            """A mapping that materialises every pair before the caller can cut it."""
+
+            def items(self) -> Any:
+                return [(str(i), payload) for i in range(50_000)]
+
+        # Every override really would flood the retry, which is what makes each branch matter.
+        assert len(WideStr('s')[:120]) == 10_000_000
+        assert len(WideBytes(b'b')[:120]) == 10_000_000
+        assert len(WideList(['l'])[:5]) == 50_000
+        assert len(WideTuple(('t',))[:5]) == 50_000
+        assert len(WideDict({'d': 'd'}).items()) == 50_000
+
+        def wide_str() -> Any:
+            """Return a str subclass with an overridden slice."""
+            return WideStr('sss')
+
+        def wide_bytes() -> Any:
+            """Return a bytes subclass with an overridden slice."""
+            return WideBytes(b'bbb')
+
+        def wide_list() -> Any:
+            """Return a list subclass with an overridden slice."""
+            return WideList(['lll'])
+
+        def wide_tuple() -> Any:
+            """Return a tuple subclass with an overridden slice."""
+            return WideTuple(('ttt',))
+
+        def wide_dict() -> Any:
+            """Return a mapping subclass with an overridden item view."""
+            return WideDict({'ddd': 'ddd'})
+
+        wrapper = CodeMode[object](max_tool_calls=5).get_wrapper_toolset(
+            _build_function_toolset(wide_str, wide_bytes, wide_list, wide_tuple, wide_dict)
+        )
+        assert isinstance(wrapper, CodeModeToolset)
+        ctx = await build_ctx(None, wrapper)
+        tools = await wrapper.get_tools(ctx)
+
+        with pytest.raises(ModelRetry) as exc_info:
+            await wrapper.call_tool(
+                'run_code',
+                {
+                    'code': (
+                        'a = await wide_str()\n'
+                        'b = await wide_bytes()\n'
+                        'd = await wide_list()\n'
+                        'e = await wide_tuple()\n'
+                        'f = await wide_dict()\n'
+                        'g = await wide_str()\n'
+                        'g'
+                    )
+                },
+                ctx,
+                tools['run_code'],
+            )
+
+        message = exc_info.value.message
+        assert len(message) < 2_000, f'summary grew to {len(message)} chars'
+        assert "returned 'sss'" in message
+        assert "returned b'bbb'" in message
+        assert "returned ['lll']" in message
+        assert "returned ['ttt']" in message  # tuples render in list notation
+        assert "returned {'ddd': 'ddd'}" in message
+        assert payload not in message
+
     async def test_duration_cap_is_not_enforced_in_workflow_code(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Under Temporal the elapsed-time cap is dropped, and the divergence is reported.
 
@@ -1069,12 +1172,13 @@ class TestCodeMode:
         assert 'xxxx' not in message
         assert 'yyyy' not in message
 
-    async def test_one_unrenderable_value_does_not_break_the_summary(self) -> None:
-        """A value that cannot be rendered degrades to its type name; everything else survives.
+    async def test_a_value_whose_own_methods_raise_still_renders(self) -> None:
+        """A mapping whose `__len__` raises is still summarised, because that `__len__` is not called.
 
-        `isinstance` matches subclasses on purpose, so a tool can return a mapping whose `__len__`
-        runs its own code and raises. Losing the whole retry to that would be the failure this
-        summary exists to prevent, arrived at from the other side.
+        This used to degrade to `<HostileLen>` through the guard in `_preview`. Reading the real
+        storage instead of asking the value removes the raise rather than catching it, so the entry
+        carries the contents. Pinned because the difference between the two answers is the whole
+        point of dispatching through the builtin.
         """
 
         class HostileLen(dict[str, int]):
@@ -1083,8 +1187,12 @@ class TestCodeMode:
             def __len__(self) -> int:
                 raise RuntimeError('hostile __len__')
 
+        # The override really does raise, so the summary surviving means it was never consulted.
+        with pytest.raises(RuntimeError, match='hostile __len__'):
+            len(HostileLen(a=1, b=2))
+
         def hostile() -> dict[str, int]:
-            """Return a mapping that cannot be rendered."""
+            """Return a mapping whose own methods raise."""
             return HostileLen(a=1, b=2)
 
         wrapper = CodeMode[object](max_tool_calls=2).get_wrapper_toolset(_build_function_toolset(hostile, add))
@@ -1101,8 +1209,9 @@ class TestCodeMode:
             )
 
         message = exc_info.value.message
-        assert '<HostileLen>' in message
-        # The blast radius is that one value: the other entry and the surrounding text are intact.
+        assert "returned {'a': 1, 'b': 2}" in message
+        assert '<HostileLen>' not in message
+        # The other entry and the surrounding text are unaffected either way.
         assert "add({'a': 1, 'b': 2}) returned 3" in message
         assert '2 nested tool calls started before the limit was reached' in message
         assert 'Account for all 2 before retrying' in message

@@ -71,6 +71,16 @@ _RETRY_PREVIEW_ITEMS = 5
 # Roughly the decimal digits that fit the character budget, checked before rendering an integer.
 _RETRY_INT_BITS = 400
 _RETRY_SUMMARY_MAX_CHARS = 2000
+# Built once so the slices below read as "the head of it" rather than as index arithmetic.
+_RETRY_TEXT_HEAD = slice(None, _RETRY_VALUE_PREVIEW_CHARS)
+_RETRY_ITEM_HEAD = slice(None, _RETRY_PREVIEW_ITEMS)
+# `_render` calls the builtin containers' methods unbound so a subclass cannot substitute its own.
+# Bare `list`/`tuple`/`dict` are unparameterized generics, whose unbound methods read as partially
+# unknown under strict typing; these aliases pin the parameters. Each is the builtin at runtime, so
+# `_List.__len__` is `list.__len__`. `str`, `bytes` and `bytearray` are not generic and need none.
+_List: type[list[Any]] = list
+_Tuple: type[tuple[Any, ...]] = tuple
+_Dict: type[dict[Any, Any]] = dict
 
 
 # One entry per limit `CodeModeResourceLimits` exposes, mapped to the wording Monty reports when
@@ -146,6 +156,35 @@ def _elided(count: int, shown: int, unit: str) -> str:
     return f' ... ({count} {unit} total)' if count > shown else ''
 
 
+def _type_name(value: Any) -> str:
+    """Name a value by its type, without letting the type choose the name.
+
+    `type(value).__name__` is an ordinary attribute lookup on a class object, so a metaclass can
+    define `__name__` as a property and answer it. One returning 5 MB puts 5 MB in the retry, and
+    one that raises escapes `_preview` from inside its own handler, which is where this is used
+    last. `type.__dict__['__name__']` is the descriptor `type` itself defines, called on the class
+    directly, so no metaclass sits in front of it. It returns an exact `str`, cut here because a
+    class name is only as short as whoever wrote it.
+
+    No tool result reaches this with a hostile metaclass today -- Monty rejects objects outside its
+    value set, leaving pydantic-ai's own multi-modal content as the reachable case. It is written
+    this way so the rule stated in `_render` holds with no exception to remember.
+    """
+    return str.__getitem__(type.__dict__['__name__'].__get__(type(value)), _RETRY_TEXT_HEAD)
+
+
+def _render_sequence(count: int, head: Sequence[Any], *, nested: bool) -> str:
+    """Render an already-cut list or tuple head, given the sequence's true length.
+
+    Both callers have taken the head through the exact builtin's `__getitem__`, so `head` is an
+    exact `list` or `tuple` and iterating it dispatches through the builtin's own `__iter__`.
+    """
+    if nested:
+        return f'[{count} items]'
+    rendered = ', '.join(_render(item, nested=True) for item in head)
+    return f'[{rendered}]' + _elided(count, _RETRY_PREVIEW_ITEMS, 'items')
+
+
 def _render(value: Any, *, nested: bool = False) -> str:
     """Render a value for an error message, cutting it before rendering rather than after.
 
@@ -157,14 +196,25 @@ def _render(value: Any, *, nested: bool = False) -> str:
     of those, one level deep. A nested container is reported by size rather than expanded, which
     bounds the work without recursing to arbitrary depth. Anything else is named by type, since
     calling `repr` on it is the unbounded allocation this exists to avoid -- a `BinaryContent`
-    result would otherwise render its entire payload.
+    result would otherwise render its entire payload. `bytearray` has no branch because Monty
+    rejects one as a tool result, at any nesting depth, before a summary can be built; a future
+    Monty that accepts it gets `<bytearray>` until a branch is written for it.
 
-    The invariant that keeps every branch bounded is that none of them calls a method the value's
-    own type can override. Text is sliced and bytes converted, which yield exact builtins before
-    anything renders them; containers are assembled here rather than through their `__repr__`;
-    scalars go through the builtin's own `__repr__`. A subclass can otherwise supply a renderer
-    that returns megabytes, which no guard catches, because returning a large string is not a
-    failure.
+    The invariant that keeps every branch bounded is that no expression here dispatches through a
+    method the value's own type can define. `isinstance` matches subclasses, so every length,
+    slice, item view and repr goes through the exact builtin's implementation called unbound --
+    `str.__len__(value)`, `list.__getitem__(value, head)`, `dict.items(value)`. Each of those
+    reads the object's real storage and returns an exact builtin, so what comes back is bounded by
+    the cut rather than by anything the subclass chose to return. Left as `len(value)` or
+    `value[:n]`, a subclass supplies its own, and a `__getitem__` that ignores the slice and
+    returns the whole payload defeats the cut. No guard catches that, because returning a large
+    result is not a failure.
+
+    Checking a new branch is therefore a static question, answered by reading the expression, not
+    by running a subclass past it and watching: name every operator, call and conversion in it,
+    say which dunder or method each dispatches through, and confirm the value's type cannot define
+    that name. Observing a well-behaved subclass proves nothing, since it describes what a
+    cooperative type does rather than what a hostile one can do.
 
     So the question to ask when adding a shape is not "does this branch copy the value", and not
     "can rendering it raise", but "can rendering it produce an unbounded result by any means,
@@ -177,20 +227,21 @@ def _render(value: Any, *, nested: bool = False) -> str:
     # `isinstance`, so subclasses still match, while the element access stays typed.
     raw: Any = value
     if isinstance(value, str):
-        return repr(value[:limit]) + _elided(len(value), limit, 'chars')
-    if isinstance(value, (bytes, bytearray)):
-        return repr(bytes(value[:limit])) + _elided(len(value), limit, 'bytes')
-    if isinstance(value, (list, tuple)):
-        if nested:
-            return f'[{len(raw)} items]'
-        rendered = ', '.join(_render(item, nested=True) for item in raw[:items])
-        return f'[{rendered}]' + _elided(len(raw), items, 'items')
+        return str.__repr__(str.__getitem__(raw, _RETRY_TEXT_HEAD)) + _elided(str.__len__(raw), limit, 'chars')
+    if isinstance(value, bytes):
+        return bytes.__repr__(bytes.__getitem__(raw, _RETRY_TEXT_HEAD)) + _elided(bytes.__len__(raw), limit, 'bytes')
+    if isinstance(value, list):
+        return _render_sequence(_List.__len__(raw), _List.__getitem__(raw, _RETRY_ITEM_HEAD), nested=nested)
+    if isinstance(value, tuple):
+        return _render_sequence(_Tuple.__len__(raw), _Tuple.__getitem__(raw, _RETRY_ITEM_HEAD), nested=nested)
     if isinstance(value, dict):
         if nested:
-            return f'{{{len(raw)} items}}'
-        pairs = islice(raw.items(), items)
+            return f'{{{_Dict.__len__(raw)} items}}'
+        # `dict.items` yields a view over the real storage, so `islice` stops after five pairs.
+        # `raw.items()` would let a subclass build and return the whole mapping first.
+        pairs = islice(_Dict.items(raw), items)
         rendered = ', '.join(f'{_render(k, nested=True)}: {_render(v, nested=True)}' for k, v in pairs)
-        return '{' + rendered + '}' + _elided(len(raw), items, 'items')
+        return '{' + rendered + '}' + _elided(_Dict.__len__(raw), items, 'items')
     if isinstance(value, bool):
         return bool.__repr__(value)
     if isinstance(value, int):
@@ -205,26 +256,30 @@ def _render(value: Any, *, nested: bool = False) -> str:
         return float.__repr__(value)
     if value is None:
         return 'None'
-    return f'<{type(value).__name__}>'
+    return f'<{_type_name(value)}>'
 
 
 def _preview(value: Any) -> str:
     """Render one caller-supplied value, naming it rather than raising if that fails.
 
-    `_render` covers the shapes a tool result or argument can take, but `isinstance` matches
-    subclasses deliberately, so a tool can return a `list` or `dict` whose `__len__` or
-    `__getitem__` runs its own code and raises. Losing the retry, and with it the record of the
-    calls that already ran, is the failure this summary exists to prevent, so a value that cannot
-    be rendered is named instead -- the answer already used for objects like `BinaryContent`.
+    Losing the retry, and with it the record of the calls that already ran, is the failure this
+    summary exists to prevent, so a value that cannot be rendered is named instead -- the answer
+    already used for objects like `BinaryContent`.
 
-    The guard covers exactly one value. The caller still produces every other entry, and a fault
-    in the summary's own logic still surfaces. It bounds what can raise, not what can take a long
+    Nothing a tool can currently return reaches an expression here that runs the value's own code:
+    every branch in `_render` dispatches through an exact builtin, and the only non-builtin values
+    Monty lets through are pydantic-ai's multi-modal content types. So the handler is a standing
+    guard over a rule rather than a fix for a known input -- worth keeping because the rule is easy
+    to break by adding a branch, and the cost of breaking it is the whole retry.
+
+    The guard covers exactly one value. The caller still produces every other entry, and a fault in
+    the summary's own logic still surfaces. It bounds what can raise, not what can take a long
     time: a `__len__` that runs for a minute still runs for a minute.
     """
     try:
         return _render(value)
-    except Exception:
-        return f'<{type(value).__name__}>'
+    except Exception:  # pragma: no cover
+        return f'<{_type_name(value)}>'
 
 
 def _describe_started_calls(calls: dict[str, ToolCallPart], returns: dict[str, ToolReturnPart]) -> str:
