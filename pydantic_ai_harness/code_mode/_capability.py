@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import KW_ONLY, dataclass, field, replace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import TypeAdapter, ValidationError
 from pydantic_ai import AbstractToolset
@@ -14,7 +14,7 @@ from pydantic_ai.messages import ModelResponse, NativeToolSearchReturnPart, Syst
 from pydantic_ai.tools import AgentDepsT, RunContext, ToolDefinition, ToolSelector
 from typing_extensions import TypedDict
 
-from pydantic_ai_harness.code_mode._toolset import CodeModeMount, CodeModeOS, CodeModeToolset
+from pydantic_ai_harness.code_mode._toolset import CodeModeMount, CodeModeOS, CodeModeResourceLimits, CodeModeToolset
 
 if TYPE_CHECKING:
     from pydantic_ai.capabilities.abstract import ValidatedToolArgs
@@ -87,11 +87,34 @@ class CodeMode(AbstractCapability[AgentDepsT]):
 
     _: KW_ONLY
 
+    max_tool_calls: int = 100
+    """Maximum nested tool calls dispatched by one `run_code` invocation.
+
+    Budget is reserved before each call is scheduled, so a snippet cannot allocate host tasks
+    beyond this many. Calls past the budget are refused at the sandbox call site.
+
+    Must be at least 1; `__aenter__` raises `UserError` otherwise. Zero is not the way to stop a
+    snippet calling tools -- `tools=[]` is, which leaves `run_code` with no callables, though the
+    unsandboxed tools stay available to the model directly.
+    """
+
     os_access: CodeModeOS | None = None
     """Give sandboxed code environment variables, the clock, and file I/O through a handler you provide; unset, they are unavailable."""
 
     mount: CodeModeMount | None = None
     """Host directories to expose to sandboxed `pathlib` code; each mount's `mode` controls whether writes reach the host."""
+
+    resource_limits: CodeModeResourceLimits | Literal['unlimited'] | None = None
+    """Sandbox execution limits, applied per Monty session.
+
+    `None` applies a 30-second execution and 256 MiB heap backstop. `max_duration_secs` bounds a
+    single snippet, not the run: consecutive calls share one session allowance, and anything that
+    replaces the session starts a fresh one -- `restart: true`, or any failure that leaves the
+    session unusable rather than idle and intact.
+    It is not enforced in Temporal workflow code, where replay would re-measure it; `CodeMode`
+    drops it there and warns. Other durability integrations, DBOS among them, enforce it normally,
+    and `max_memory` is never dropped. `'unlimited'` removes both caps.
+    """
 
     dynamic_catalog: bool = False
     """Keep the `run_code` tool definition cache-stable as the sandboxed toolset grows.
@@ -141,6 +164,8 @@ class CodeMode(AbstractCapability[AgentDepsT]):
             wrapped=toolset,
             tool_selector=self.tools,
             max_retries=self.max_retries,
+            max_tool_calls=self.max_tool_calls,
+            resource_limits=self.resource_limits,
             dynamic_catalog=self.dynamic_catalog,
             os_access=self.os_access,
             mount=self.mount,

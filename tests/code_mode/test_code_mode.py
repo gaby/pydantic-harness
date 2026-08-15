@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import sys
+import warnings
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 from unittest.mock import MagicMock
 
 import pytest
@@ -23,7 +25,7 @@ from pydantic_ai import (
     Tool,
     ToolDefinition,
 )
-from pydantic_ai.exceptions import ModelRetry
+from pydantic_ai.exceptions import ModelRetry, UserError
 from pydantic_ai.messages import ToolCallPart
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.tool_manager import ParallelExecutionMode, ToolManager
@@ -35,7 +37,7 @@ from pydantic_monty import NOT_HANDLED, Monty, MountDir, OSAccess, OsFunction
 from typing_extensions import Never, TypedDict
 
 from pydantic_ai_harness import CodeMode
-from pydantic_ai_harness.code_mode import CodeModeToolset
+from pydantic_ai_harness.code_mode import CodeModeResourceLimits, CodeModeToolset
 from pydantic_ai_harness.code_mode._toolset import (  # pyright: ignore[reportPrivateUsage]
     _SEARCH_TOOLS_MODIFIER,
     _TOOL_SEARCH_ADDENDUM,
@@ -500,6 +502,932 @@ class TestCodeMode:
         result = await wrapper.call_tool('run_code', {'code': 'x + 1'}, ctx, tools['run_code'])
         assert result.return_value == 8
 
+    async def test_run_code_caps_nested_tool_calls(self) -> None:
+        """A snippet that exceeds `max_tool_calls` ends with a retry naming the limit."""
+        wrapper = CodeMode[object](max_tool_calls=2).get_wrapper_toolset(_build_function_toolset(add))
+        assert isinstance(wrapper, CodeModeToolset)
+        ctx = await build_ctx(None, wrapper)
+        tools = await wrapper.get_tools(ctx)
+
+        with pytest.raises(ModelRetry, match=r'allows 2 nested tool calls'):
+            await wrapper.call_tool(
+                'run_code',
+                {'code': 'import asyncio\nawait asyncio.gather(add(a=1, b=1), add(a=2, b=2), add(a=3, b=3))'},
+                ctx,
+                tools['run_code'],
+            )
+
+    async def test_nested_call_budget_is_reserved_before_dispatch(self) -> None:
+        """Calls past the budget never run, so a gather cannot outrun the limit before it bites.
+
+        The executor schedules each deferred call as a task without yielding in between, so a
+        budget checked inside the dispatch coroutine would admit every call in the gather.
+        """
+        executed: list[int] = []
+
+        def record(value: int) -> int:
+            """Record a call."""
+            executed.append(value)
+            return value
+
+        wrapper = CodeMode[object](max_tool_calls=3).get_wrapper_toolset(_build_function_toolset(record))
+        assert isinstance(wrapper, CodeModeToolset)
+        ctx = await build_ctx(None, wrapper)
+        tools = await wrapper.get_tools(ctx)
+
+        await wrapper.call_tool(
+            'run_code',
+            {'code': 'import asyncio\nawait asyncio.gather(*[record(value=i) for i in range(3)])'},
+            ctx,
+            tools['run_code'],
+        )
+        assert sorted(executed) == [0, 1, 2]
+
+        executed.clear()
+        with pytest.raises(ModelRetry, match=r'allows 3 nested tool calls'):
+            await wrapper.call_tool(
+                'run_code',
+                {'code': 'import asyncio\nawait asyncio.gather(*[record(value=i) for i in range(50)])'},
+                ctx,
+                tools['run_code'],
+            )
+
+        # The refusal happens while the executor is still scheduling, before any dispatched task
+        # has been given the event loop, so none of the 50 calls reaches the tool.
+        assert executed == []
+
+    async def test_exhausted_budget_preserves_completed_calls(self) -> None:
+        """A refused call fails inside the sandbox, so work already done is not thrown away.
+
+        Sequential `await`s complete one at a time, so the calls before the budget runs out have
+        really happened and may have had side effects. Aborting the snippet there would lose the
+        record of them and invite the model to repeat them on its retry.
+        """
+        executed: list[int] = []
+
+        def record(value: int) -> int:
+            """Record a call."""
+            executed.append(value)
+            return value
+
+        wrapper = CodeMode[object](max_tool_calls=3).get_wrapper_toolset(_build_function_toolset(record))
+        assert isinstance(wrapper, CodeModeToolset)
+        ctx = await build_ctx(None, wrapper)
+        tools = await wrapper.get_tools(ctx)
+
+        result = await wrapper.call_tool(
+            'run_code',
+            {
+                'code': (
+                    'done = []\n'
+                    'for i in range(10):\n'
+                    '    try:\n'
+                    '        done.append(await record(value=i))\n'
+                    '    except Exception:\n'
+                    '        break\n'
+                    'done'
+                )
+            },
+            ctx,
+            tools['run_code'],
+        )
+
+        assert executed == [0, 1, 2]
+        assert result.return_value == [0, 1, 2]
+        assert len(result.metadata['tool_calls']) == 3
+        assert len(result.metadata['tool_returns']) == 3
+
+    async def test_uncaught_budget_exhaustion_names_completed_calls(self) -> None:
+        """An uncaught refusal still tells the model which calls already ran.
+
+        This is the shape a model actually writes: a plain sequential loop with no `try`. The
+        retry is the only record it gets, so without the completed calls it reruns their side
+        effects when it retries with a smaller batch.
+        """
+        executed: list[int] = []
+
+        def record(value: int) -> int:
+            """Record a call."""
+            executed.append(value)
+            return value
+
+        wrapper = CodeMode[object](max_tool_calls=3).get_wrapper_toolset(_build_function_toolset(record))
+        assert isinstance(wrapper, CodeModeToolset)
+        ctx = await build_ctx(None, wrapper)
+        tools = await wrapper.get_tools(ctx)
+
+        with pytest.raises(ModelRetry) as exc_info:
+            await wrapper.call_tool(
+                'run_code',
+                {'code': 'out = []\nfor i in range(10):\n    out.append(await record(value=i))\nout'},
+                ctx,
+                tools['run_code'],
+            )
+
+        assert executed == [0, 1, 2]
+        message = exc_info.value.message
+        assert '3 nested tool calls started before the limit was reached' in message
+        for value in (0, 1, 2):
+            assert f"record({{'value': {value}}}) returned {value}" in message
+
+    async def test_duration_exhaustion_points_at_restart(self) -> None:
+        """A spent duration allowance tells the model to restart, not to rewrite the snippet.
+
+        The allowance is per session and this error keeps the session, so every later call fails
+        on arrival; only `restart: true` recovers it. Detection matches Monty's rendered timeout
+        text, so this drives a real exhausted session rather than a fixed string: if Monty rewords
+        the message, this test fails instead of the hint quietly disappearing.
+        """
+        wrapper = CodeMode[object](resource_limits={'max_duration_secs': 0.3}).get_wrapper_toolset(
+            _build_function_toolset(add)
+        )
+        assert isinstance(wrapper, CodeModeToolset)
+        ctx = await build_ctx(None, wrapper)
+        tools = await wrapper.get_tools(ctx)
+        spend_it = 'y = 0\nfor i in range(100_000_000):\n    y += i\ny'
+
+        with pytest.raises(ModelRetry) as exc_info:
+            await wrapper.call_tool('run_code', {'code': spend_it}, ctx, tools['run_code'])
+        assert '`restart: true`' in exc_info.value.message
+
+        # The session is kept, so a later trivial snippet fails on arrival and needs the same hint.
+        with pytest.raises(ModelRetry) as later:
+            await wrapper.call_tool('run_code', {'code': '1 + 1'}, ctx, tools['run_code'])
+        assert '`restart: true`' in later.value.message
+
+        # And restarting really does clear it, which is what the hint promises.
+        result = await wrapper.call_tool('run_code', {'code': '1 + 1', 'restart': True}, ctx, tools['run_code'])
+        assert result.return_value == 2
+
+    async def test_tool_error_resembling_a_timeout_is_not_treated_as_exhaustion(self) -> None:
+        """A nested tool failing with the sandbox's timeout wording must not trigger the hint.
+
+        Monty re-raises a tool's exception at the sandbox call site keeping its message, so text
+        alone cannot tell the two apart. A false positive is worse than a miss here: it tells the
+        model to restart, discarding REPL state the session is still perfectly able to use.
+        """
+
+        def boom() -> str:
+            """Fail with wording that matches the sandbox's own timeout."""
+            raise ValueError('time limit exceeded: 999s > 1s')
+
+        wrapper = CodeMode[object]().get_wrapper_toolset(_build_function_toolset(boom))
+        assert isinstance(wrapper, CodeModeToolset)
+        ctx = await build_ctx(None, wrapper)
+        tools = await wrapper.get_tools(ctx)
+
+        seeded = await wrapper.call_tool('run_code', {'code': 'saved = 42\nsaved'}, ctx, tools['run_code'])
+        assert seeded.return_value == 42
+
+        with pytest.raises(ModelRetry) as exc_info:
+            await wrapper.call_tool('run_code', {'code': 'await boom()'}, ctx, tools['run_code'])
+        assert 'time limit exceeded' in exc_info.value.message
+        assert 'restart' not in exc_info.value.message
+
+        # The session was never exhausted, so its REPL state is still there to use.
+        kept = await wrapper.call_tool('run_code', {'code': 'saved'}, ctx, tools['run_code'])
+        assert kept.return_value == 42
+
+    async def test_duration_exhaustion_reports_calls_already_made(self) -> None:
+        """Restarting discards REPL state, so the retry has to say what already ran.
+
+        Otherwise the advice is to throw away the only record of the work while giving the model
+        nothing to reconstruct it from.
+        """
+        wrapper = CodeMode[object](resource_limits={'max_duration_secs': 0.3}).get_wrapper_toolset(
+            _build_function_toolset(add)
+        )
+        assert isinstance(wrapper, CodeModeToolset)
+        ctx = await build_ctx(None, wrapper)
+        tools = await wrapper.get_tools(ctx)
+
+        with pytest.raises(ModelRetry) as exc_info:
+            await wrapper.call_tool(
+                'run_code',
+                {'code': ('r = await add(a=1, b=2)\ny = 0\nfor i in range(100_000_000):\n    y += i\ny')},
+                ctx,
+                tools['run_code'],
+            )
+
+        message = exc_info.value.message
+        assert '`restart: true`' in message
+        assert '1 nested tool calls started' in message
+        assert "add({'a': 1, 'b': 2}) returned 3" in message
+
+    async def test_memory_exhaustion_reports_calls_without_advising_restart(self) -> None:
+        """Exceeding `max_memory` reports what already ran, but is not a reason to restart.
+
+        The session still has its duration allowance and later calls work, so the restart advice
+        would be wrong here even though the summary is just as necessary.
+        """
+        wrapper = CodeMode[object](resource_limits={'max_memory': 8 * 1024 * 1024}).get_wrapper_toolset(
+            _build_function_toolset(add)
+        )
+        assert isinstance(wrapper, CodeModeToolset)
+        ctx = await build_ctx(None, wrapper)
+        tools = await wrapper.get_tools(ctx)
+
+        with pytest.raises(ModelRetry) as exc_info:
+            await wrapper.call_tool(
+                'run_code',
+                {'code': 'r = await add(a=1, b=2)\nx = [0] * 50_000_000\nlen(x)'},
+                ctx,
+                tools['run_code'],
+            )
+
+        message = exc_info.value.message
+        assert 'memory limit exceeded' in message
+        assert "add({'a': 1, 'b': 2}) returned 3" in message
+        assert 'restart' not in message
+
+    async def test_every_resource_limit_reports_started_calls_when_exhausted(self) -> None:
+        """Exhausting any option a caller can set still reports the calls that already ran.
+
+        Driven per limit rather than by inspecting the recognizer, so it tests the behaviour the
+        recognizer exists to provide. Adding an option to `CodeModeResourceLimits` without a case
+        here fails the coverage assertion below, which is what stops a new limit from silently
+        losing its summary.
+        """
+        exhaust_by_limit: dict[str, tuple[CodeModeResourceLimits, str]] = {
+            'max_duration_secs': (
+                {'max_duration_secs': 0.3},
+                'y = 0\nfor i in range(100_000_000):\n    y += i\ny',
+            ),
+            'max_memory': ({'max_memory': 8 * 1024 * 1024}, 'x = [0] * 50_000_000\nlen(x)'),
+        }
+        assert set(exhaust_by_limit) == set(CodeModeResourceLimits.__annotations__), (
+            'a new resource limit needs a case here, so that exhausting it is shown to still '
+            'report the nested calls that already ran'
+        )
+
+        for limits, exhaust in exhaust_by_limit.values():
+            wrapper = CodeMode[object](resource_limits=limits).get_wrapper_toolset(_build_function_toolset(add))
+            assert isinstance(wrapper, CodeModeToolset)
+            ctx = await build_ctx(None, wrapper)
+            tools = await wrapper.get_tools(ctx)
+
+            with pytest.raises(ModelRetry) as exc_info:
+                await wrapper.call_tool(
+                    'run_code',
+                    {'code': f'r = await add(a=1, b=2)\n{exhaust}'},
+                    ctx,
+                    tools['run_code'],
+                )
+            assert "add({'a': 1, 'b': 2}) returned 3" in exc_info.value.message
+
+    async def test_preview_bounds_every_payload_shape(self) -> None:
+        """Previews cut each shape at the source, including ones whose `repr` would be huge.
+
+        `BinaryContent` is the case that motivates naming a value by type: it reaches the summary
+        as the raw object, so rendering it would put its whole payload in the retry.
+        """
+        from pydantic_ai.messages import BinaryContent
+
+        def shapes(tag: str, rows: list[int], opts: dict[str, int], ratio: float) -> dict[str, Any]:
+            """Return a mix of payload shapes."""
+            return {
+                'text': 'z' * 50_000,
+                'raw': b'\xff' * 50_000,
+                'blob': BinaryContent(data=b'\x89PNG' * 20_000, media_type='image/png'),
+                # `repr` of this raises above the interpreter's digit limit, which would replace
+                # the retry with a host error.
+                'huge': 10**5000,
+                'count': 7,
+            }
+
+        def many_rows() -> list[int]:
+            """Return a long list."""
+            return list(range(50))
+
+        wrapper = CodeMode[object](max_tool_calls=2).get_wrapper_toolset(_build_function_toolset(shapes, many_rows))
+        assert isinstance(wrapper, CodeModeToolset)
+        ctx = await build_ctx(None, wrapper)
+        tools = await wrapper.get_tools(ctx)
+
+        with pytest.raises(ModelRetry) as exc_info:
+            await wrapper.call_tool(
+                'run_code',
+                {
+                    'code': (
+                        "a = await shapes(tag='t', rows=[1, 2], opts={'k': 1}, ratio=0.5)\n"
+                        'b = await many_rows()\n'
+                        'c = await many_rows()\n'
+                        'a'
+                    )
+                },
+                ctx,
+                tools['run_code'],
+            )
+
+        message = exc_info.value.message
+        assert len(message) < 3_000, f'preview grew to {len(message)} chars'
+        assert '50000 chars total' in message  # long text cut at the source
+        assert '50000 bytes total' in message  # long bytes cut at the source
+        assert '<BinaryContent>' in message  # named by type, never rendered
+        assert '<int of 16610 bits>' in message  # sized, not rendered: repr would raise
+        assert '{1 items}' in message  # nested mapping argument reported by size
+        assert '[2 items]' in message  # nested list argument likewise
+        assert '0.5' in message  # plain scalars still render
+        assert '(50 items total)' in message  # long list cut to its first few
+
+    async def test_containers_render_through_the_builtin_not_the_value(self) -> None:
+        """A container subclass cannot substitute its own slice or item view into the retry.
+
+        Same failure as the scalar case, reached through a different name: `isinstance` matches
+        subclasses, so `value[:120]`, `raw[:5]` and `raw.items()` all dispatch to whatever the type
+        defines, and a `__getitem__` that ignores the slice hands back the whole payload. That
+        succeeds, so no guard catches it. Each container shape takes its own branch and each is
+        covered here, because the fix is per-expression rather than shared.
+        """
+
+        payload = 'x' * 200
+
+        class WideStr(str):
+            """A str whose slice ignores the bound."""
+
+            def __getitem__(self, key: Any) -> Any:
+                return payload * 50_000
+
+        class WideBytes(bytes):
+            """Bytes whose slice ignores the bound."""
+
+            def __getitem__(self, key: Any) -> Any:
+                return payload.encode() * 50_000
+
+        class WideList(list[str]):
+            """A list whose slice returns far more than the requested head."""
+
+            def __getitem__(self, key: Any) -> Any:
+                return [payload] * 50_000
+
+        class WideTuple(tuple[str, ...]):
+            """A tuple whose slice returns far more than the requested head."""
+
+            def __getitem__(self, key: Any) -> Any:
+                return (payload,) * 50_000
+
+        class WideDict(dict[str, str]):
+            """A mapping that materialises every pair before the caller can cut it."""
+
+            def items(self) -> Any:
+                return [(str(i), payload) for i in range(50_000)]
+
+        # Every override really would flood the retry, which is what makes each branch matter.
+        assert len(WideStr('s')[:120]) == 10_000_000
+        assert len(WideBytes(b'b')[:120]) == 10_000_000
+        assert len(WideList(['l'])[:5]) == 50_000
+        assert len(WideTuple(('t',))[:5]) == 50_000
+        assert len(WideDict({'d': 'd'}).items()) == 50_000
+
+        def wide_str() -> Any:
+            """Return a str subclass with an overridden slice."""
+            return WideStr('sss')
+
+        def wide_bytes() -> Any:
+            """Return a bytes subclass with an overridden slice."""
+            return WideBytes(b'bbb')
+
+        def wide_list() -> Any:
+            """Return a list subclass with an overridden slice."""
+            return WideList(['lll'])
+
+        def wide_tuple() -> Any:
+            """Return a tuple subclass with an overridden slice."""
+            return WideTuple(('ttt',))
+
+        def wide_dict() -> Any:
+            """Return a mapping subclass with an overridden item view."""
+            return WideDict({'ddd': 'ddd'})
+
+        wrapper = CodeMode[object](max_tool_calls=5).get_wrapper_toolset(
+            _build_function_toolset(wide_str, wide_bytes, wide_list, wide_tuple, wide_dict)
+        )
+        assert isinstance(wrapper, CodeModeToolset)
+        ctx = await build_ctx(None, wrapper)
+        tools = await wrapper.get_tools(ctx)
+
+        with pytest.raises(ModelRetry) as exc_info:
+            await wrapper.call_tool(
+                'run_code',
+                {
+                    'code': (
+                        'a = await wide_str()\n'
+                        'b = await wide_bytes()\n'
+                        'd = await wide_list()\n'
+                        'e = await wide_tuple()\n'
+                        'f = await wide_dict()\n'
+                        'g = await wide_str()\n'
+                        'g'
+                    )
+                },
+                ctx,
+                tools['run_code'],
+            )
+
+        message = exc_info.value.message
+        assert len(message) < 2_000, f'summary grew to {len(message)} chars'
+        assert "returned 'sss'" in message
+        assert "returned b'bbb'" in message
+        assert "returned ['lll']" in message
+        assert "returned ['ttt']" in message  # tuples render in list notation
+        assert "returned {'ddd': 'ddd'}" in message
+        assert payload not in message
+
+    async def test_duration_cap_is_not_enforced_in_workflow_code(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Under Temporal the elapsed-time cap is dropped, and the divergence is reported.
+
+        Snippets are re-executed during replay, so a re-measured timeout could pass on one
+        execution and trip on another, changing the workflow history. Silence would be worse than
+        the cap: the caller configured a limit that is not being applied.
+        """
+        # Temporal is an optional extra, so the no-extras matrix job skips these rather than
+        # failing to import it.
+        workflow = pytest.importorskip('temporalio.workflow')
+        monkeypatch.setattr(workflow, 'in_workflow', lambda: True)
+
+        wrapper = CodeMode[object](resource_limits={'max_duration_secs': 0.3}).get_wrapper_toolset(
+            _build_function_toolset(add)
+        )
+        assert isinstance(wrapper, CodeModeToolset)
+
+        # Reported when the run starts, not from inside `call_tool`, where warnings-as-errors
+        # would be caught and turned into a retry.
+        with pytest.warns(RuntimeWarning, match='not enforcing `max_duration_secs`'):
+            ctx = await build_ctx(None, wrapper)
+        tools = await wrapper.get_tools(ctx)
+
+        # Well past 0.3 seconds of sandbox work, and it completes, so the cap is really off.
+        spend_it = 'y = 0\nfor i in range(20_000_000):\n    y += i\ny'
+        with warnings.catch_warnings():
+            warnings.simplefilter('error', RuntimeWarning)
+            result = await wrapper.call_tool('run_code', {'code': spend_it}, ctx, tools['run_code'])
+            again = await wrapper.call_tool('run_code', {'code': spend_it}, ctx, tools['run_code'])
+        assert result.return_value == 199999990000000
+        assert again.return_value == 199999990000000
+
+    async def test_workflow_duration_report_is_once_per_capability(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An agent is reused across runs, so entering again must not repeat the report."""
+        # Temporal is an optional extra, so the no-extras matrix job skips these rather than
+        # failing to import it.
+        workflow = pytest.importorskip('temporalio.workflow')
+        monkeypatch.setattr(workflow, 'in_workflow', lambda: True)
+
+        wrapper = CodeMode[object]().get_wrapper_toolset(_build_function_toolset(add))
+        assert isinstance(wrapper, CodeModeToolset)
+
+        with pytest.warns(RuntimeWarning, match='not enforcing `max_duration_secs`'):
+            await wrapper.__aenter__()
+        await wrapper.__aexit__(None, None, None)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter('error', RuntimeWarning)
+            await wrapper.__aenter__()
+        await wrapper.__aexit__(None, None, None)
+
+    async def test_workflow_duration_report_is_once_per_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Pins how often the report actually reaches a caller across two runs of one agent.
+
+        `for_run` clones with `replace`, which reinitializes the flag, so the report is once per
+        run rather than once per capability. Under Python's default filter that difference is
+        invisible, because repeats from one call site are collapsed, which is why the flag is not
+        shared across clones. Both counts are pinned so neither can drift from the docs unnoticed.
+        """
+        # Temporal is an optional extra, so the no-extras matrix job skips these rather than
+        # failing to import it.
+        workflow = pytest.importorskip('temporalio.workflow')
+        monkeypatch.setattr(workflow, 'in_workflow', lambda: True)
+
+        from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
+        from pydantic_ai.models.function import AgentInfo, FunctionModel
+
+        def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            if not any(isinstance(message, ModelResponse) for message in messages):
+                return ModelResponse(parts=[ToolCallPart('run_code', {'code': 'await add(a=1, b=2)'})])
+            return ModelResponse(parts=[TextPart('done')])
+
+        async def count_with(action: Literal['default', 'always']) -> int:
+            agent: Agent[object, str] = Agent(
+                FunctionModel(model_fn),
+                toolsets=[_build_function_toolset(add)],
+                capabilities=[CodeMode[object]()],
+            )
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter(action)
+                for _ in range(2):
+                    await agent.run('go')
+            return len([w for w in caught if 'not enforcing `max_duration_secs`' in str(w.message)])
+
+        # What a caller on stock settings sees: one report, however many runs.
+        assert await count_with('default') == 1
+        # Without deduplication the per-run reset is visible, which is what the docs describe.
+        assert await count_with('always') == 2
+
+    async def test_call_and_memory_caps_still_apply_in_workflow_code(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Only the elapsed-time cap is replay-sensitive, so the other two keep working.
+
+        A snippet allocates the same on replay and the call budget is a function of the snippet,
+        so neither moves the decision and dropping them would give up protection for nothing.
+        """
+        # Temporal is an optional extra, so the no-extras matrix job skips these rather than
+        # failing to import it.
+        workflow = pytest.importorskip('temporalio.workflow')
+        monkeypatch.setattr(workflow, 'in_workflow', lambda: True)
+
+        memory_capped = CodeMode[object](resource_limits={'max_memory': 8 * 1024 * 1024}).get_wrapper_toolset(
+            _build_function_toolset(add)
+        )
+        assert isinstance(memory_capped, CodeModeToolset)
+        # The default duration limit still counts as configured, so entering warns; this test is
+        # about the other two caps surviving.
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', RuntimeWarning)
+            ctx = await build_ctx(None, memory_capped)
+        tools = await memory_capped.get_tools(ctx)
+        with pytest.raises(ModelRetry, match='memory limit exceeded'):
+            await memory_capped.call_tool('run_code', {'code': 'x = [0] * 50_000_000\nlen(x)'}, ctx, tools['run_code'])
+
+        call_capped = CodeMode[object](max_tool_calls=2).get_wrapper_toolset(_build_function_toolset(add))
+        assert isinstance(call_capped, CodeModeToolset)
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', RuntimeWarning)
+            ctx2 = await build_ctx(None, call_capped)
+        tools2 = await call_capped.get_tools(ctx2)
+        with pytest.raises(ModelRetry, match='allows 2 nested tool calls'):
+            await call_capped.call_tool(
+                'run_code',
+                {'code': 'o = []\nfor i in range(5):\n    o.append(await add(a=i, b=1))\no'},
+                ctx2,
+                tools2['run_code'],
+            )
+
+    async def test_unlimited_in_workflow_code_warns_about_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """With no duration limit configured there is no divergence to report."""
+        # Temporal is an optional extra, so the no-extras matrix job skips these rather than
+        # failing to import it.
+        workflow = pytest.importorskip('temporalio.workflow')
+        monkeypatch.setattr(workflow, 'in_workflow', lambda: True)
+
+        wrapper = CodeMode[object](resource_limits='unlimited').get_wrapper_toolset(_build_function_toolset(add))
+        assert isinstance(wrapper, CodeModeToolset)
+        with warnings.catch_warnings():
+            warnings.simplefilter('error', RuntimeWarning)
+            ctx = await build_ctx(None, wrapper)
+        tools = await wrapper.get_tools(ctx)
+
+        result = await wrapper.call_tool('run_code', {'code': '1 + 1'}, ctx, tools['run_code'])
+        assert result.return_value == 2
+
+    async def test_missing_temporalio_leaves_the_duration_cap_enforced(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Detection fails safe: no `temporalio` means no workflow, so the cap still applies.
+
+        An optional dependency being absent must never be what disables a limit.
+        """
+        monkeypatch.setitem(sys.modules, 'temporalio', None)
+
+        wrapper = CodeMode[object](resource_limits={'max_duration_secs': 0.3}).get_wrapper_toolset(
+            _build_function_toolset(add)
+        )
+        assert isinstance(wrapper, CodeModeToolset)
+        ctx = await build_ctx(None, wrapper)
+        tools = await wrapper.get_tools(ctx)
+
+        with pytest.raises(ModelRetry, match='time limit exceeded'):
+            await wrapper.call_tool(
+                'run_code',
+                {'code': 'y = 0\nfor i in range(100_000_000):\n    y += i\ny'},
+                ctx,
+                tools['run_code'],
+            )
+
+    async def test_scalars_render_from_the_builtin_not_the_value(self) -> None:
+        """A scalar subclass cannot render itself into the retry.
+
+        The guard around a value only bounds what raises, and a `__repr__` returning megabytes
+        succeeds, so the branch has to avoid calling the value's own renderer at all. Covers each
+        scalar shape, since they take separate branches.
+        """
+
+        class LoudInt(int):
+            """An int whose repr is enormous."""
+
+            def __repr__(self) -> str:
+                return 'x' * 5_000_000
+
+        class LoudFloat(float):
+            """A float whose repr is enormous."""
+
+            def __repr__(self) -> str:
+                return 'y' * 5_000_000
+
+        # The overrides really would flood the retry, which is what makes the branch matter.
+        assert len(repr(LoudInt(5))) == 5_000_000
+        assert len(repr(LoudFloat(1.5))) == 5_000_000
+
+        def loud_int() -> int:
+            """Return an int with an overridden repr."""
+            return LoudInt(5)
+
+        def loud_float() -> float:
+            """Return a float with an overridden repr."""
+            return LoudFloat(1.5)
+
+        def flag() -> bool:
+            """Return a boolean."""
+            return True
+
+        def nothing() -> None:
+            """Return nothing."""
+            return None
+
+        wrapper = CodeMode[object](max_tool_calls=4).get_wrapper_toolset(
+            _build_function_toolset(loud_int, loud_float, flag, nothing)
+        )
+        assert isinstance(wrapper, CodeModeToolset)
+        ctx = await build_ctx(None, wrapper)
+        tools = await wrapper.get_tools(ctx)
+
+        with pytest.raises(ModelRetry) as exc_info:
+            await wrapper.call_tool(
+                'run_code',
+                {
+                    'code': (
+                        'a = await loud_int()\n'
+                        'b = await loud_float()\n'
+                        'c = await flag()\n'
+                        'd = await nothing()\n'
+                        'e = await loud_int()\n'
+                        'e'
+                    )
+                },
+                ctx,
+                tools['run_code'],
+            )
+
+        message = exc_info.value.message
+        assert len(message) < 2_000, f'summary grew to {len(message)} chars'
+        assert 'returned 5' in message  # the number, not the override
+        assert 'returned 1.5' in message
+        assert 'returned True' in message
+        assert 'returned None' in message
+        assert 'xxxx' not in message
+        assert 'yyyy' not in message
+
+    async def test_a_value_whose_own_methods_raise_still_renders(self) -> None:
+        """A mapping whose `__len__` raises is still summarised, because that `__len__` is not called.
+
+        This used to degrade to `<HostileLen>` through the guard in `_preview`. Reading the real
+        storage instead of asking the value removes the raise rather than catching it, so the entry
+        carries the contents. Pinned because the difference between the two answers is the whole
+        point of dispatching through the builtin.
+        """
+
+        class HostileLen(dict[str, int]):
+            """A mapping whose length cannot be taken."""
+
+            def __len__(self) -> int:
+                raise RuntimeError('hostile __len__')
+
+        # The override really does raise, so the summary surviving means it was never consulted.
+        with pytest.raises(RuntimeError, match='hostile __len__'):
+            len(HostileLen(a=1, b=2))
+
+        def hostile() -> dict[str, int]:
+            """Return a mapping whose own methods raise."""
+            return HostileLen(a=1, b=2)
+
+        wrapper = CodeMode[object](max_tool_calls=2).get_wrapper_toolset(_build_function_toolset(hostile, add))
+        assert isinstance(wrapper, CodeModeToolset)
+        ctx = await build_ctx(None, wrapper)
+        tools = await wrapper.get_tools(ctx)
+
+        with pytest.raises(ModelRetry) as exc_info:
+            await wrapper.call_tool(
+                'run_code',
+                {'code': 'a = await hostile()\nb = await add(a=1, b=2)\nc = await add(a=3, b=4)\nc'},
+                ctx,
+                tools['run_code'],
+            )
+
+        message = exc_info.value.message
+        assert "returned {'a': 1, 'b': 2}" in message
+        assert '<HostileLen>' not in message
+        # The other entry and the surrounding text are unaffected either way.
+        assert "add({'a': 1, 'b': 2}) returned 3" in message
+        assert '2 nested tool calls started before the limit was reached' in message
+        assert 'Account for all 2 before retrying' in message
+
+    async def test_ordinary_runtime_error_does_not_mention_restart(self) -> None:
+        """A plain exception keeps the message it always had; the hint is not bolted onto everything."""
+        wrapper = CodeMode[object]().get_wrapper_toolset(_build_function_toolset(add))
+        assert isinstance(wrapper, CodeModeToolset)
+        ctx = await build_ctx(None, wrapper)
+        tools = await wrapper.get_tools(ctx)
+
+        with pytest.raises(ModelRetry) as exc_info:
+            await wrapper.call_tool('run_code', {'code': 'raise ValueError("boom")'}, ctx, tools['run_code'])
+
+        message = exc_info.value.message
+        assert 'boom' in message
+        assert 'restart' not in message
+
+    async def test_budget_retry_names_calls_that_raised(self) -> None:
+        """A call that raised is listed too, since a tool can apply a change before failing.
+
+        It has no recorded return, so summarizing from the returns alone would stay silent about
+        exactly the calls most likely to have left partial state.
+        """
+
+        def flaky(value: int) -> int:
+            """Raise for one particular value."""
+            if value == 1:
+                raise ValueError('failed after doing work')
+            return value
+
+        wrapper = CodeMode[object](max_tool_calls=3).get_wrapper_toolset(_build_function_toolset(flaky))
+        assert isinstance(wrapper, CodeModeToolset)
+        ctx = await build_ctx(None, wrapper)
+        tools = await wrapper.get_tools(ctx)
+
+        with pytest.raises(ModelRetry) as exc_info:
+            await wrapper.call_tool(
+                'run_code',
+                {
+                    'code': (
+                        'o = []\n'
+                        'for i in range(10):\n'
+                        '    try:\n'
+                        '        o.append(await flaky(value=i))\n'
+                        '    except ValueError:\n'
+                        '        pass\n'
+                        'o'
+                    )
+                },
+                ctx,
+                tools['run_code'],
+            )
+
+        message = exc_info.value.message
+        assert "flaky({'value': 1}) raised, so it may have applied a partial change" in message
+        assert "flaky({'value': 0}) returned 0" in message
+
+    async def test_budget_retry_marks_denied_calls_as_not_run(self) -> None:
+        """A denied call is called out as not having run.
+
+        It has a recorded return, so lumping it in with the successes would tell the model not to
+        repeat a call whose tool never executed.
+        """
+        from pydantic_ai.capabilities import HandleDeferredToolCalls
+        from pydantic_ai.exceptions import ApprovalRequired as _ApprovalRequired
+        from pydantic_ai.tools import DeferredToolRequests, DeferredToolResults, ToolDenied
+
+        def needs_approval(value: int) -> str:
+            """A tool that requires approval."""
+            raise _ApprovalRequired()
+
+        async def handler(ctx: RunContext[object], requests: DeferredToolRequests) -> DeferredToolResults:
+            return DeferredToolResults(
+                approvals={call.tool_call_id: ToolDenied(message='nope') for call in requests.approvals}
+            )
+
+        wrapper = CodeMode[object](max_tool_calls=1).get_wrapper_toolset(_build_function_toolset(needs_approval))
+        assert isinstance(wrapper, CodeModeToolset)
+        ctx = await build_ctx(None, wrapper, root_capability=HandleDeferredToolCalls(handler=handler))
+        tools = await wrapper.get_tools(ctx)
+
+        with pytest.raises(ModelRetry) as exc_info:
+            await wrapper.call_tool(
+                'run_code',
+                {
+                    'code': (
+                        'try:\n'
+                        '    await needs_approval(value=1)\n'
+                        'except Exception:\n'
+                        '    pass\n'
+                        'await needs_approval(value=2)'
+                    )
+                },
+                ctx,
+                tools['run_code'],
+            )
+
+        assert "needs_approval({'value': 1}) was denied and did not run" in exc_info.value.message
+
+    async def test_budget_retry_bounds_previews_and_total_size(self) -> None:
+        """Arguments and results are previewed, and the whole summary is capped.
+
+        Without both bounds a snippet returning large payloads turns the retry into a prompt far
+        larger than the output the model asked for.
+        """
+
+        def bulky(value: int) -> str:
+            """Return a large payload."""
+            return 'x' * 50_000
+
+        wrapper = CodeMode[object](max_tool_calls=30).get_wrapper_toolset(_build_function_toolset(bulky))
+        assert isinstance(wrapper, CodeModeToolset)
+        ctx = await build_ctx(None, wrapper)
+        tools = await wrapper.get_tools(ctx)
+
+        with pytest.raises(ModelRetry) as exc_info:
+            await wrapper.call_tool(
+                'run_code',
+                {'code': 'o = []\nfor i in range(40):\n    o.append(await bulky(value=i))\no'},
+                ctx,
+                tools['run_code'],
+            )
+
+        message = exc_info.value.message
+        assert len(message) < 5_000, f'summary grew to {len(message)} chars'
+        assert 'chars total)' in message
+        assert 'more not shown' in message
+        # The count is the part that survives truncation, so it has to stay exact: it is what
+        # tells the model the visible list is incomplete.
+        assert '30 nested tool calls started before the limit was reached' in message
+        assert 'Account for all 30 before retrying' in message
+
+    async def test_exhausted_budget_on_sequential_tool_preserves_completed_calls(self) -> None:
+        """The budget refusal reaches the sandbox for inline-resolved tools too.
+
+        A `sequential=True` tool is rendered as `def` and resolved inline rather than deferred,
+        so it takes a different dispatch path than the parallel case.
+        """
+        executed: list[int] = []
+
+        def record(value: int) -> int:
+            """Record a call."""
+            executed.append(value)
+            return value
+
+        wrapper = CodeMode[object](max_tool_calls=2).get_wrapper_toolset(
+            FunctionToolset[object](tools=[Tool(record, sequential=True)])
+        )
+        assert isinstance(wrapper, CodeModeToolset)
+        ctx = await build_ctx(None, wrapper)
+        tools = await wrapper.get_tools(ctx)
+
+        result = await wrapper.call_tool(
+            'run_code',
+            {
+                'code': (
+                    'done = []\n'
+                    'for i in range(6):\n'
+                    '    try:\n'
+                    '        done.append(record(value=i))\n'
+                    '    except Exception:\n'
+                    '        break\n'
+                    'done'
+                )
+            },
+            ctx,
+            tools['run_code'],
+        )
+
+        assert executed == [0, 1]
+        assert result.return_value == [0, 1]
+
+    async def test_new_options_do_not_shift_positional_arguments(self) -> None:
+        """`CodeModeToolset` is public advanced API, so its positional order has to stay put.
+
+        `os_access`, `mount`, and `dynamic_catalog` shipped as positional parameters. Adding
+        options ahead of them would silently rebind existing callers' arguments rather than fail.
+        """
+        os_access = OSAccess(environ={'TOKEN': 'secret'})
+        mount = MountDir(virtual_path='/work', host_path='/tmp', mode='read-only')
+
+        toolset = CodeModeToolset[object](_build_function_toolset(add), 'all', 3, os_access, mount, True)
+
+        assert toolset.os_access is os_access
+        assert toolset.mount is mount
+        assert toolset.dynamic_catalog is True
+        assert toolset.max_tool_calls == 100
+        assert toolset.resource_limits is None
+
+    async def test_resource_limits_accept_overrides_and_unlimited(self) -> None:
+        """Both an explicit cap and `'unlimited'` reach the sandbox session."""
+        options: list[CodeModeResourceLimits | Literal['unlimited']] = [
+            {'max_duration_secs': 5, 'max_memory': 64 * 1024 * 1024},
+            'unlimited',
+        ]
+        for limits in options:
+            wrapper = CodeMode[object](resource_limits=limits).get_wrapper_toolset(_build_function_toolset(add))
+            assert isinstance(wrapper, CodeModeToolset)
+            ctx = await build_ctx(None, wrapper)
+            tools = await wrapper.get_tools(ctx)
+            result = await wrapper.call_tool('run_code', {'code': 'await add(a=2, b=3)'}, ctx, tools['run_code'])
+            assert result.return_value == 5
+
+    async def test_resource_limit_configuration_is_validated_on_enter(self) -> None:
+        invalid = CodeModeToolset[object](
+            wrapped=_build_function_toolset(add),
+            resource_limits={'unknown': 1},  # pyright: ignore[reportArgumentType]
+        )
+        with pytest.raises(UserError, match='Unknown `resource_limits` key'):
+            await invalid.__aenter__()
+
+        zero_calls = CodeModeToolset[object](wrapped=_build_function_toolset(add), max_tool_calls=0)
+        with pytest.raises(UserError, match='`max_tool_calls` must be at least 1'):
+            await zero_calls.__aenter__()
+
     async def test_run_code_syntax_error_becomes_model_retry(self) -> None:
         """A Python syntax error is surfaced as `ModelRetry` so the model can fix it."""
         wrapper = CodeMode[object]().get_wrapper_toolset(_build_function_toolset(add))
@@ -532,6 +1460,40 @@ class TestCodeMode:
             await empty_wrapper.call_tool('run_code', {'code': 'def ('}, empty_ctx, empty_tools['run_code'])
         assert empty_wrapper._run_state is not None  # pyright: ignore[reportPrivateUsage]
         assert empty_wrapper._run_state.session is None  # pyright: ignore[reportPrivateUsage]
+
+    async def test_later_syntax_error_keeps_the_session_and_its_spent_allowance(self) -> None:
+        """A syntax error after a successful feed keeps the session; only a first-feed one resets it.
+
+        Both snippets fail without running, so "no code ran" does not separate them. What does is
+        whether the session ran anything earlier: `fresh_repl` is false once a feed has executed, so
+        the reset is skipped and the session keeps its REPL state and its spent duration allowance.
+        The allowance is per session, so holding the same session is what pins it -- asserted by
+        identity rather than by timing a burn, which would race the slower CI runners.
+        """
+        wrapper = CodeMode[object]().get_wrapper_toolset(_build_function_toolset(add))
+        assert isinstance(wrapper, CodeModeToolset)
+        ctx = await build_ctx(None, wrapper)
+        tools = await wrapper.get_tools(ctx)
+        run_code = tools['run_code']
+        run_state = wrapper._run_state  # pyright: ignore[reportPrivateUsage]
+        assert run_state is not None
+
+        await wrapper.call_tool('run_code', {'code': 'x = 41\nx'}, ctx, run_code)
+        before = run_state.session
+        assert before is not None
+
+        with pytest.raises(ModelRetry, match=r'Syntax error in code'):
+            await wrapper.call_tool('run_code', {'code': 'def ('}, ctx, run_code)
+
+        assert run_state.session is before, 'a later syntax error must not replace the session'
+        result = await wrapper.call_tool('run_code', {'code': 'x + 1'}, ctx, run_code)
+        assert result.return_value == 42
+
+        # The contrast: `restart: true` is what does replace it, and the REPL state goes with it.
+        await wrapper.call_tool('run_code', {'code': '1 + 1', 'restart': True}, ctx, run_code)
+        assert run_state.session is not before
+        with pytest.raises(ModelRetry, match=r"name 'x' is not defined"):
+            await wrapper.call_tool('run_code', {'code': 'x'}, ctx, run_code)
 
     async def test_run_code_typing_error_becomes_model_retry(self) -> None:
         """A `MontyTypingError` from static type checking is translated into `ModelRetry`.
@@ -627,7 +1589,7 @@ class TestCodeMode:
             assert events == ['wrapped enter']
             assert wrapper._run_state is not None  # pyright: ignore[reportPrivateUsage]
             wrapper._run_state.get_session(  # pyright: ignore[reportPrivateUsage]
-                type_check=False, type_check_stubs=None
+                type_check=False, type_check_stubs=None, limits={}
             )
             assert events == ['wrapped enter', 'monty enter', 'session enter']
 
@@ -1869,10 +2831,17 @@ class TestCodeMode:
         run_code = tools['run_code']
 
         await wrapper.call_tool('run_code', {'code': 'x = 1'}, ctx, run_code)
+        run_state = wrapper._run_state  # pyright: ignore[reportPrivateUsage]
+        assert run_state is not None
+        before = run_state.session
         with monkeypatch.context() as patcher:
             patcher.setattr('pydantic_ai_harness._monty_exec.MontyExecutor.run', _panic)
             with pytest.raises(ModelRetry, match='aborted inside the sandbox'):
                 await wrapper.call_tool('run_code', {'code': 'x'}, ctx, run_code)
+        # The session object is replaced, not just emptied. The duration allowance is per session,
+        # so this is what makes the docs' "each replacement renews the allowance" true of a panic
+        # as well -- it is a separate branch from the worker crash, with its own retry message.
+        assert run_state.session is not before
         with pytest.raises(ModelRetry, match='Type error in code'):
             await wrapper.call_tool('run_code', {'code': 'x'}, ctx, run_code)
 
@@ -2812,6 +3781,29 @@ class TestCodeModeOSAccess:
         # (wrongly) advertise env/clock as host-routed -- this assert fails if the OS note is picked.
         assert 'Mounted filesystem access' in description
         assert "writes through a `mode='overlay'` mount last only for the current `run_code` call" in description
+
+    async def test_empty_selector_leaves_run_code_with_nothing_to_dispatch(self) -> None:
+        """`tools=[]` is what makes a snippet unable to call tools, which `max_tool_calls=0` is not.
+
+        The docs point here for a computation-only sandbox, so the two halves of that are pinned:
+        `run_code` gets no callables, and the tool stays available to the model directly rather
+        than disappearing from the agent.
+        """
+        wrapper = CodeMode[object](tools=[]).get_wrapper_toolset(_build_function_toolset(add))
+        assert isinstance(wrapper, CodeModeToolset)
+        ctx = await build_ctx(None, wrapper)
+        tools = await wrapper.get_tools(ctx)
+
+        assert sorted(tools) == ['add', 'run_code']
+        # Nothing was sandboxed, so the catalog the model reads offers no callable.
+        description = tools['run_code'].tool_def.description
+        assert description is not None
+        assert 'async def add' not in description
+        # Computation still runs; only dispatch is gone.
+        result = await wrapper.call_tool('run_code', {'code': 'sum(i * i for i in range(10))'}, ctx, tools['run_code'])
+        assert result.return_value == 285
+        with pytest.raises(ModelRetry, match=r'Runtime error'):
+            await wrapper.call_tool('run_code', {'code': 'await add(a=1, b=2)'}, ctx, tools['run_code'])
 
     async def test_description_host_access_note_shows_with_no_sandboxed_tools(self) -> None:
         """The host-access note appears even when no tools are sandboxed (base description)."""

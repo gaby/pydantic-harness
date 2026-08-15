@@ -171,9 +171,72 @@ Reserve `print()` for supplementary logging: printed text is surfaced separately
 
 Printed output is limited to 10 MiB. Exceeding the limit makes `run_code` return a model retry.
 
+Sandbox execution is bounded by `resource_limits`, which defaults to 30 seconds of execution time
+and a 256 MiB heap. Outside Temporal workflow code, `max_duration_secs` gives a per-snippet
+ceiling: no single `run_code` snippet runs longer than that much sandbox time, which is what stops
+a runaway loop. Time spent awaiting a nested tool is excluded from that timer.
+
+That ceiling is not enforced in Temporal workflow code, and nowhere else. `run_code` runs
+workflow-side under `TemporalDurability` and its snippets are re-executed during replay, so an
+elapsed-time decision would be measured again rather than replayed from history: the same snippet
+could finish on the original worker and time out under replay load, changing whether a retry
+happened and so which activities the workflow scheduled. `CodeMode` therefore drops
+`max_duration_secs` there and warns once per run with a `RuntimeWarning` that it is doing so. **Inside a
+Temporal workflow, nothing here bounds sandbox CPU time**; the applicable guidance is the one below
+under Temporal durability, to keep sandbox loops bounded in the snippets themselves. This is
+specific to Temporal rather than to durability in general: a DBOS workflow enforces the cap
+normally. `max_memory` and `max_tool_calls` are never dropped, since a snippet allocates the same
+on replay and the call budget is a function of the snippet rather than of the machine.
+
+Where the cap does apply, it is still not a run-wide CPU budget, and cannot be relied on as one.
+Monty applies the limits per sandbox session, so consecutive `run_code` calls draw down one shared
+allowance and each new session starts with a full one. Sessions are replaced by `restart: true`, and
+by any failure that leaves the session unusable or its REPL state untrustworthy: a worker crash, a
+sandbox abort, a type error, a host-side failure, and a syntax error on a session's first feed are
+among them. Each replacement renews the allowance without the model asking for a restart.
+
+The reliable way to read that is from the other side, since it is one rule rather than a list to
+keep current: a session survives only a failure that leaves it idle and intact. An exception raised
+inside a running snippet is one, which covers a nested tool raising, a refused nested call, and a
+sandbox limit tripping. So is a syntax error on a session that has already run something -- that
+snippet's code did not run, but the session's earlier code did, so it keeps its REPL state and its
+spent allowance, and rewriting the snippet buys back no time.
+
+Once a session's allowance is spent, every later `run_code` call fails on arrival, including
+snippets that would cost almost nothing, because they reuse the same session. Rewriting the code
+does not help. `restart: true` is what recovers it, at the cost of the REPL state that session was
+holding, so any variables, imports, and definitions have to be recreated. `run_code` says as much
+in the retry it returns, and that retry also reports the nested calls the snippet already made, so
+restarting does not throw away the only record of them. The behaviour is worth knowing when
+choosing `max_duration_secs`: set it low and a long agent run will spend it on ordinary work and
+pay a restart to continue.
+
+Nested tool calls are bounded separately by `max_tool_calls`, which defaults to 100 per `run_code`
+call and must be at least 1; a lower value raises `UserError` when the run starts rather than at
+the first `run_code` call. Zero is not how to stop a snippet calling tools: `tools=[]` does
+that, leaving `run_code` with no callables, though the unsandboxed tools stay available to the
+model directly. The budget is reserved before each call is scheduled, so a snippet cannot dispatch
+more work than it allows. A call past the budget fails at its call site inside the sandbox. A snippet that
+catches the error keeps the results of the calls that already completed and can return them. A
+snippet that lets it propagate gets a model retry reporting how many nested calls started,
+followed by per-call detail: what each was called with, and whether it returned, raised, or was
+denied. Calls that raised are included rather than filtered out, since a tool can apply a change
+before failing. That detail is bounded -- arguments and results are previewed, and the list stops
+at a size cap and says how many entries it left out -- so a large payload cannot inflate the
+retry. The reported total stays exact whether or not the list was cut, which is what tells the
+model some calls are missing from what it can see. The list is context for the model, not a guard:
+nothing stops it from calling those tools again, so treat it as informing the next attempt rather
+than preventing a repeat.
+
+Override them with `resource_limits={'max_duration_secs': 10, 'max_memory': 134_217_728}` and
+`max_tool_calls=25`. A mapping is merged onto the defaults rather than replacing them, so
+`resource_limits={'max_memory': 134_217_728}` changes the heap and leaves the 30-second cap in
+place, and a snippet can still end in a timeout retry. `resource_limits='unlimited'` is what clears
+both caps; pass it only when another execution boundary supplies equivalent limits.
+
 ## REPL state
 
-State persists between `run_code` calls within the same agent run -- variables, imports, and function definitions carry over. Pass `restart: true` in the tool call to reset state. If a worker crash or host-side execution failure invalidates the session, `run_code` returns a model retry that reports the reset; the next snippet must recreate any required state.
+State persists between `run_code` calls within the same agent run -- variables, imports, and function definitions carry over. Pass `restart: true` in the tool call to reset state. If a failure invalidates the session -- a worker crash, a sandbox abort or a host-side execution failure, among others -- `run_code` returns a model retry that reports the reset; the next snippet must recreate any required state.
 
 ## Temporal durability
 
@@ -216,6 +279,21 @@ other side effects in wrapped tools so Temporal records them as activities. Repl
 changed arguments when the same activity remains at the same history position, so replay validation
 is not a substitute for this boundary. Temporal activity timeouts apply to nested tools, not pure
 computation inside `run_code`, so keep sandbox loops bounded.
+
+That guidance is what bounds sandbox CPU time here, because `resource_limits['max_duration_secs']`
+is not enforced in workflow code. Enforcing it would re-measure elapsed time on every replay, and a
+snippet near the threshold could pass once and time out the next time, changing the recorded
+history. `CodeMode` drops the cap there and warns once per run with a `RuntimeWarning`; the warning
+names the setting so the gap between what was configured and what applies is visible rather
+than discovered later. `max_memory` and `max_tool_calls` still apply. A builtin warning category is used
+deliberately: the workflow sandbox re-imports harness modules, so a harness-defined category would
+be a different class than the one a filter names and could not be suppressed.
+
+Recording the decision instead of re-measuring it would be the real fix: if `run_code` ran inside a
+Temporal activity, its outcome would be written to history once and replayed rather than
+recomputed. That is a change to Pydantic AI core rather than to this package, since
+`TemporalDurability` decides what becomes an activity, and it has to contend with the REPL being
+process-local to one agent run, which is why `run_code` is workflow-side today.
 
 ## Observability
 

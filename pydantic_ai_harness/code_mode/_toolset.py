@@ -6,10 +6,11 @@ import inspect
 import keyword
 import re
 import warnings
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Coroutine, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
-from typing import Annotated, Any
+from itertools import islice
+from typing import Annotated, Any, Literal
 
 from pydantic import Field, TypeAdapter
 from pydantic_ai import AbstractToolset, RunContext, ToolDefinition, WrapperToolset
@@ -26,6 +27,7 @@ from pydantic_ai.messages import (
 from pydantic_ai.tool_manager import ParallelExecutionMode, ToolManager
 from pydantic_ai.tools import AgentDepsT, ToolDenied, ToolSelector, matches_tool_selector
 from pydantic_ai.toolsets.abstract import SchemaValidatorProt, ToolsetTool
+from typing_extensions import NotRequired, Self, TypedDict
 
 try:
     from pydantic_ai.toolsets._tool_search import _SEARCH_TOOLS_NAME  # pyright: ignore[reportPrivateUsage]
@@ -43,13 +45,12 @@ try:
         MontyTypingError,
         MountDir,
         OsFunction,
+        ResourceLimits,
     )
 except ImportError as _import_error:  # pragma: no cover
     raise ImportError(
         'pydantic-monty is required for CodeMode. Install it with: pip install "pydantic-ai-harness[code-mode]"'
     ) from _import_error
-from typing_extensions import NotRequired, Self, TypedDict
-
 from pydantic_ai_harness._monty_exec import MontyExecutor, PrintCapture, is_sandbox_panic
 
 # A raw OS callback. Return `pydantic_monty.NOT_HANDLED` to defer the call to the
@@ -59,6 +60,294 @@ CodeModeOSCallback = Callable[[OsFunction, tuple[object, ...], dict[str, object]
 CodeModeOS = AbstractOS | CodeModeOSCallback
 # Accepted by `CodeMode.mount`: one or more host-directory mounts.
 CodeModeMount = MountDir | list[MountDir]
+
+
+# Bounds for the nested-call summary appended to a budget-exhaustion retry. Monty caps printed
+# output at 10 MiB by raising, which suits a stream the model asked for but not a summary the
+# host adds to an error, so these are separate and much smaller: the summary exists to identify
+# calls, not to redeliver their payloads.
+_RETRY_VALUE_PREVIEW_CHARS = 120
+_RETRY_PREVIEW_ITEMS = 5
+# Roughly the decimal digits that fit the character budget, checked before rendering an integer.
+_RETRY_INT_BITS = 400
+_RETRY_SUMMARY_MAX_CHARS = 2000
+# Built once so the slices below read as "the head of it" rather than as index arithmetic.
+_RETRY_TEXT_HEAD = slice(None, _RETRY_VALUE_PREVIEW_CHARS)
+_RETRY_ITEM_HEAD = slice(None, _RETRY_PREVIEW_ITEMS)
+# `_render` calls the builtin containers' methods unbound so a subclass cannot substitute its own.
+# Bare `list`/`tuple`/`dict` are unparameterized generics, whose unbound methods read as partially
+# unknown under strict typing; these aliases pin the parameters. Each is the builtin at runtime, so
+# `_List.__len__` is `list.__len__`. `str`, `bytes` and `bytearray` are not generic and need none.
+_List: type[list[Any]] = list
+_Tuple: type[tuple[Any, ...]] = tuple
+_Dict: type[dict[Any, Any]] = dict
+
+
+# One entry per limit `CodeModeResourceLimits` exposes, mapped to the wording Monty reports when
+# it trips. Monty offers no typed marker for either, so its phrasing is load-bearing here and
+# nowhere else. `test_every_resource_limit_reports_started_calls_when_exhausted` exhausts each
+# option the type declares and checks the summary survives, so a limit added without an entry here
+# fails there rather than silently losing its summary, and a Monty reword fails it rather than
+# quietly disabling recognition.
+_SANDBOX_LIMIT_MARKERS = {
+    'max_duration_secs': 'time limit exceeded',
+    'max_memory': 'memory limit exceeded',
+}
+
+
+def _in_temporal_workflow() -> bool:
+    """Whether this is running inside Temporal workflow code.
+
+    `run_code` runs workflow-side under `TemporalDurability` and its snippets are re-executed
+    during replay, so an elapsed-time decision made here is re-measured rather than replayed from
+    history. Fails safe: no `temporalio` means no workflow, so the caller keeps enforcing.
+    """
+    try:
+        from temporalio import workflow
+    except ImportError:
+        return False
+    return workflow.in_workflow()
+
+
+def _exhausted_sandbox_limit(error: MontyRuntimeError) -> str | None:
+    """Which `CodeModeResourceLimits` limit this runtime error reports, or `None` for anything else.
+
+    Derived from `_SANDBOX_LIMIT_MARKERS` rather than from a check per limit, so recognising a new
+    limit is a table entry and forgetting one is a test failure.
+
+    This gates the started-call summary, so it deliberately errs toward inclusion and matches on
+    Monty's wording alone. A nested tool that fails with one of these phrases in its own message is
+    misread, and that costs nothing: the summary only states which calls really started, which is
+    true regardless of why the snippet ended. The restart guidance cannot afford the same
+    looseness and uses `_is_duration_exhausted` instead.
+    """
+    message = error.display(format='msg')
+    for limit, marker in _SANDBOX_LIMIT_MARKERS.items():
+        if marker in message:
+            return limit
+    return None
+
+
+def _is_duration_exhausted(error: MontyRuntimeError) -> bool:
+    """Whether this runtime error is Monty's spent `max_duration_secs` allowance.
+
+    Stricter than `_exhausted_sandbox_limit` because it gates advice to restart, and a wrong
+    restart discards REPL state the session could still use. A missed one only costs the hint.
+
+    The empty traceback is the structural signal: the duration limit interrupts execution rather
+    than failing at a particular operation, and Monty attaches no frame to it, measured at top
+    level and three calls deep alike. Failures that happen at a sandbox site carry at least the
+    module frame, including an exception a nested tool raised that Monty re-raised at the call
+    site, which keeps the tool's own message. Wording alone would therefore misread a tool that
+    failed with `'time limit exceeded'` in its message.
+
+    Exceeding `max_memory` is excluded by either signal, since it reports different wording and
+    carries a frame from the allocation that tripped it. Keeping both means neither has to be
+    sound alone.
+
+    Callers must read `False` as "add nothing", not as "not a timeout". A miss leaves the ordinary
+    runtime-error message intact, which is the behaviour that shipped before the hint existed.
+    """
+    return not error.traceback() and _exhausted_sandbox_limit(error) == 'max_duration_secs'
+
+
+def _elided(count: int, shown: int, unit: str) -> str:
+    """Note how much a preview left out, or nothing when it left out nothing."""
+    return f' ... ({count} {unit} total)' if count > shown else ''
+
+
+def _type_name(value: Any) -> str:
+    """Name a value by its type, without letting the type choose the name.
+
+    `type(value).__name__` is an ordinary attribute lookup on a class object, so a metaclass can
+    define `__name__` as a property and answer it. One returning 5 MB puts 5 MB in the retry, and
+    one that raises escapes `_preview` from inside its own handler, which is where this is used
+    last. `type.__dict__['__name__']` is the descriptor `type` itself defines, called on the class
+    directly, so no metaclass sits in front of it. It returns an exact `str`, cut here because a
+    class name is only as short as whoever wrote it.
+
+    Monty rejects objects outside its value set, so the reachable case here is pydantic-ai's own
+    multi-modal content and no tool result arrives with a hostile metaclass today. It is written
+    this way so the rule stated in `_render` holds with no exception to remember.
+    """
+    return str.__getitem__(type.__dict__['__name__'].__get__(type(value)), _RETRY_TEXT_HEAD)
+
+
+def _render_sequence(count: int, head: Sequence[Any], *, nested: bool) -> str:
+    """Render an already-cut list or tuple head, given the sequence's true length.
+
+    Both callers have taken the head through the exact builtin's `__getitem__`, so `head` is an
+    exact `list` or `tuple` and iterating it dispatches through the builtin's own `__iter__`.
+    """
+    if nested:
+        return f'[{count} items]'
+    rendered = ', '.join(_render(item, nested=True) for item in head)
+    return f'[{rendered}]' + _elided(count, _RETRY_PREVIEW_ITEMS, 'items')
+
+
+def _render(value: Any, *, nested: bool = False) -> str:
+    """Render a value for an error message, cutting it before rendering rather than after.
+
+    Rendering first and slicing after would copy the whole payload to produce 120 characters: a
+    20 MB tool result cost 40 MB of allocation that way, spent while the host is already handling
+    a resource failure. So each shape is cut at the source instead.
+
+    Only the shapes a tool result or argument can take are rendered: text, bytes, and containers
+    of those, one level deep. A nested container is reported by size rather than expanded, which
+    bounds the work without recursing to arbitrary depth. Anything else is named by type, since
+    calling `repr` on it is the unbounded allocation this exists to avoid -- a `BinaryContent`
+    result would otherwise render its entire payload. `bytearray` has no branch because Monty
+    rejects one as a tool result, at any nesting depth, before a summary can be built; a future
+    Monty that accepts it gets `<bytearray>` until a branch is written for it.
+
+    The invariant that keeps every branch bounded is that no expression here obtains a value
+    through a name the object's own type can define. `isinstance` matches subclasses, so every
+    length, slice, item view and repr goes through the exact builtin's implementation called
+    unbound -- `str.__len__(value)`, `list.__getitem__(value, head)`, `dict.items(value)`. Each of
+    those reads the object's real storage and returns an exact builtin, so what comes back is
+    bounded by the cut rather than by anything the subclass chose to return. Left as `len(value)`
+    or `value[:n]`, a subclass supplies its own, and a `__getitem__` that ignores the slice and
+    returns the whole payload defeats the cut. No guard catches that, because returning a large
+    result is not a failure. The one name still consulted on the object is `__class__`, which
+    `isinstance` falls back to when the exact-type check misses; it can raise, which `_preview`
+    covers, but nothing here uses what it returns, so it cannot enlarge a result.
+
+    Checking a new branch is therefore a static question, answered by reading the expression rather
+    than by running a subclass past it and watching: name every operator, call and conversion in
+    it, say which dunder or method each dispatches through, and confirm the value's type cannot
+    define that name. What a well-behaved subclass does under observation says nothing about what a
+    hostile one can do, which is how the branches below were first cleared and got this wrong.
+
+    So the question to ask when adding a shape is not "does this branch copy the value", and not
+    "can rendering it raise", but "can rendering it produce an unbounded result by any means,
+    including a call that succeeds". Integers pass the first two and failed the third.
+    """
+    limit = _RETRY_VALUE_PREVIEW_CHARS
+    items = _RETRY_PREVIEW_ITEMS
+    # `isinstance` on a bare `list`/`dict` narrows to an unparameterized generic, which reads as
+    # partially unknown under strict typing. Keeping an unnarrowed alias lets the checks stay
+    # `isinstance`, so subclasses still match, while the builtin calls below stay typed.
+    raw: Any = value
+    if isinstance(value, str):
+        return str.__repr__(str.__getitem__(raw, _RETRY_TEXT_HEAD)) + _elided(str.__len__(raw), limit, 'chars')
+    if isinstance(value, bytes):
+        return bytes.__repr__(bytes.__getitem__(raw, _RETRY_TEXT_HEAD)) + _elided(bytes.__len__(raw), limit, 'bytes')
+    if isinstance(value, list):
+        return _render_sequence(_List.__len__(raw), _List.__getitem__(raw, _RETRY_ITEM_HEAD), nested=nested)
+    if isinstance(value, tuple):
+        return _render_sequence(_Tuple.__len__(raw), _Tuple.__getitem__(raw, _RETRY_ITEM_HEAD), nested=nested)
+    if isinstance(value, dict):
+        if nested:
+            return f'{{{_Dict.__len__(raw)} items}}'
+        # `dict.items` yields a view over the real storage, so `islice` stops after five pairs.
+        # `raw.items()` would let a subclass build and return the whole mapping first.
+        pairs = islice(_Dict.items(raw), items)
+        rendered = ', '.join(f'{_render(k, nested=True)}: {_render(v, nested=True)}' for k, v in pairs)
+        return '{' + rendered + '}' + _elided(_Dict.__len__(raw), items, 'items')
+    if isinstance(value, bool):
+        return bool.__repr__(value)
+    if isinstance(value, int):
+        # `int.__repr__` and `int.bit_length`, not the value's own, so a subclass cannot render
+        # this instead. Beyond that, `repr` on a large int is not bounded by the size of the
+        # number: it builds the whole decimal expansion, and above the interpreter's digit limit
+        # raises `ValueError`, which here would replace the retry with an uncaught host error.
+        # `bit_length` answers how big it is without rendering it.
+        bits = int.bit_length(value)
+        return int.__repr__(value) if bits <= _RETRY_INT_BITS else f'<int of {bits} bits>'
+    if isinstance(value, float):
+        return float.__repr__(value)
+    if value is None:
+        return 'None'
+    return f'<{_type_name(value)}>'
+
+
+def _preview(value: Any) -> str:
+    """Render one caller-supplied value, naming it rather than raising if that fails.
+
+    Losing the retry, and with it the record of the calls that already ran, is the failure this
+    summary exists to prevent, so a value that cannot be rendered is named instead -- the answer
+    already used for objects like `BinaryContent`.
+
+    Every branch in `_render` dispatches through an exact builtin, and Monty rejects objects
+    outside its value set, so the paths that would run a value's own code are not reachable from a
+    tool result today. The handler is therefore a standing guard over a rule rather than a fix for
+    a known input -- worth keeping because the rule is easy to break by adding a branch, and the
+    cost of breaking it is the whole retry.
+
+    The guard covers exactly one value. The caller still produces every other entry, and a fault in
+    the summary's own logic still surfaces. It bounds what can raise, not what can take a long
+    time: a `__len__` that runs for a minute still runs for a minute.
+    """
+    try:
+        return _render(value)
+    except Exception:  # pragma: no cover
+        return f'<{_type_name(value)}>'
+
+
+def _describe_started_calls(calls: dict[str, ToolCallPart], returns: dict[str, ToolReturnPart]) -> str:
+    """Report how many nested calls started, with per-call detail inside a size cap.
+
+    Keyed off `calls` rather than `returns` because a call that raised has no recorded return, and
+    a tool can commit a side effect before raising. Those are the calls most likely to have left
+    partial state, so omitting them by kind would hide exactly what the model needs to check.
+
+    The per-call lines are bounded, so a long run drops the tail and says how many it dropped. The
+    total is always exact: it is the part that survives truncation, and it is what tells the model
+    the list it can see is incomplete.
+    """
+    lines: list[str] = []
+    used = 0
+    for call_id, call in calls.items():
+        result = returns.get(call_id)
+        # `ToolReturnPart.outcome` also allows 'failed' and 'interrupted', but this function only
+        # ever sees parts built above, which set 'denied' or leave the default 'success'. Record
+        # any further outcome here rather than letting it fall through and read as a return.
+        if result is None:
+            outcome = 'raised, so it may have applied a partial change'
+        elif result.outcome == 'denied':
+            outcome = 'was denied and did not run'
+        else:
+            outcome = f'returned {_preview(result.content)}'
+        line = f'- {call.tool_name}({_preview(call.args)}) {outcome}'
+        if used + len(line) > _RETRY_SUMMARY_MAX_CHARS:
+            lines.append(f'- ... and {len(calls) - len(lines)} more not shown')
+            break
+        lines.append(line)
+        used += len(line)
+    return (
+        f'{len(calls)} nested tool calls started before the limit was reached:\n'
+        + '\n'.join(lines)
+        + f'\nAccount for all {len(calls)} before retrying; repeating a call repeats whatever it already did.'
+    )
+
+
+class CodeModeResourceLimits(TypedDict, total=False):
+    """Caps on the sandbox code executed by `run_code`.
+
+    Monty enforces these per session. Consecutive `run_code` calls therefore share one duration
+    allowance, and anything that resets the session starts a fresh one, so `max_duration_secs`
+    bounds a single snippet rather than the run. It is dropped in Temporal workflow code, where
+    replay would re-measure it and change the recorded history.
+    """
+
+    max_duration_secs: float
+    max_memory: int
+
+
+def _resolve_resource_limits(limits: CodeModeResourceLimits | Literal['unlimited'] | None) -> ResourceLimits:
+    """Merge caller overrides onto the `run_code` backstop."""
+    defaults: ResourceLimits = {'max_duration_secs': 30, 'max_memory': 256 * 1024 * 1024}
+    if limits is None:
+        return defaults
+    if limits == 'unlimited':
+        return {}
+    unknown = set(limits) - set(CodeModeResourceLimits.__annotations__)
+    if unknown:
+        raise UserError(
+            f'Unknown `resource_limits` key(s): {sorted(unknown)}. '
+            f'Valid keys are {sorted(CodeModeResourceLimits.__annotations__)}.'
+        )
+    return {**defaults, **limits}
 
 
 @dataclass
@@ -71,13 +360,13 @@ class _MontyRunState:
     _pool_stack: ExitStack = field(default_factory=ExitStack, repr=False)
     _session_stack: ExitStack = field(default_factory=ExitStack, repr=False)
 
-    def get_session(self, *, type_check: bool, type_check_stubs: str | None) -> MontySession:
+    def get_session(self, *, type_check: bool, type_check_stubs: str | None, limits: ResourceLimits) -> MontySession:
         """Return the run's live REPL session, creating its pool on first use."""
         if self.pool is None:
             self.pool = self._pool_stack.enter_context(Monty())
         if self.session is None:
             self.session = self._session_stack.enter_context(
-                self.pool.checkout(type_check=type_check, type_check_stubs=type_check_stubs)
+                self.pool.checkout(limits=limits, type_check=type_check, type_check_stubs=type_check_stubs)
             )
         return self.session
 
@@ -327,6 +616,32 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
     max_retries: int = 3
     """Maximum number of retries for the `run_code` tool (syntax errors count as retries)."""
 
+    # Keyword-only: `os_access`, `mount`, and `dynamic_catalog` shipped as positional parameters,
+    # so inserting these into the positional sequence would silently rebind existing callers'
+    # arguments (an `OSAccess` passed fourth would land in `max_tool_calls`).
+    max_tool_calls: int = field(default=100, kw_only=True)
+    """Maximum nested tool calls dispatched by one `run_code` invocation.
+
+    Budget is reserved before each call is scheduled, so a snippet cannot allocate host tasks
+    beyond this many. Calls past the budget are refused at the sandbox call site.
+
+    Must be at least 1; `__aenter__` raises `UserError` otherwise. Zero is not the way to stop a
+    snippet calling tools -- `tools=[]` is, which leaves `run_code` with no callables, though the
+    unsandboxed tools stay available to the model directly.
+    """
+
+    resource_limits: CodeModeResourceLimits | Literal['unlimited'] | None = field(default=None, kw_only=True)
+    """Sandbox execution limits, applied per Monty session.
+
+    `None` applies a 30-second execution and 256 MiB heap backstop. `max_duration_secs` bounds a
+    single snippet, not the run: consecutive calls share one session allowance, and anything that
+    replaces the session starts a fresh one -- `restart: true`, or any failure that leaves the
+    session unusable rather than idle and intact.
+    It is not enforced in Temporal workflow code, where replay would re-measure it; `CodeMode`
+    drops it there and warns. Other durability integrations, DBOS among them, enforce it normally,
+    and `max_memory` is never dropped. `'unlimited'` removes both caps.
+    """
+
     os_access: CodeModeOS | None = None
     """Give sandboxed code environment variables, the clock, and file I/O through a handler you provide; unset, they are unavailable."""
 
@@ -352,6 +667,13 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
     # `get_instructions` in the same step. Empty when there's nothing to surface.
     _last_catalog: str = field(default='', init=False, repr=False)
 
+    # Set once the elapsed-time cap has been reported as unenforced, so a run warns once rather
+    # than once per `run_code` call. `for_run` clones with `replace`, which reinitializes this, so
+    # an agent reused across runs reports again on each one. That is left alone deliberately:
+    # Python's default filter collapses repeats from one call site, so a caller sees it once
+    # anyway, and sharing the flag across clones would be machinery for an invisible difference.
+    _warned_unenforced_duration: bool = field(default=False, init=False, repr=False, compare=False)
+
     # Tracks deferred-tool names we've already warned about so we don't spam the
     # logs every step. Reset on `for_run` because each run gets a fresh instance.
     _warned_deferred: set[str] = field(default_factory=set[str], init=False, repr=False)
@@ -372,8 +694,53 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
         new_self._last_catalog = self._last_catalog
         return new_self
 
+    def _session_limits(self) -> ResourceLimits:
+        """Resolve the limits for a session checkout, dropping what replay cannot reproduce.
+
+        `run_code` runs in workflow code under `TemporalDurability` and its snippets are
+        re-executed on replay, so an elapsed-time cap is re-measured instead of replayed from
+        history. A snippet near the threshold can pass originally and trip on replay, which
+        changes whether a retry happens, which changes the activities the workflow schedules.
+        The cap is therefore not enforced there.
+
+        `max_memory` and `max_tool_calls` stay: a snippet allocates the same on replay, and the
+        call budget is a function of the snippet rather than of the machine, so neither moves the
+        decision. Dropping them would give up protection for nothing.
+        """
+        limits = _resolve_resource_limits(self.resource_limits)
+        if _in_temporal_workflow():
+            limits.pop('max_duration_secs', None)
+        return limits
+
     async def __aenter__(self) -> Self:
         """Enter the wrapped toolset and prepare lazy Monty resources for this run."""
+        # Reject misconfiguration when the run starts rather than at the first `run_code` call,
+        # which may be many model steps later. The resolved value is recomputed at checkout.
+        resolved = _resolve_resource_limits(self.resource_limits)
+        if self.max_tool_calls < 1:
+            raise UserError('`max_tool_calls` must be at least 1')
+        # Reported here rather than from `_session_limits`, which runs inside the handler that
+        # converts exceptions into retries: a caller running with warnings as errors would have
+        # turned this into a `ModelRetry`, perturbing the very history it warns about.
+        #
+        # `RuntimeWarning` rather than a harness category because this only ever fires inside the
+        # Temporal workflow sandbox, which re-imports harness modules, so a harness-defined class
+        # is a different object than the one any filter names and cannot be matched. A builtin is
+        # the same object everywhere, so this stays suppressible; the message carries the detail
+        # the category would have.
+        if resolved.get('max_duration_secs') is not None and _in_temporal_workflow():
+            if not self._warned_unenforced_duration:
+                self._warned_unenforced_duration = True
+                warnings.warn(
+                    'CodeMode is not enforcing `max_duration_secs` because `run_code` runs in '
+                    'Temporal workflow code, where snippets are re-executed during replay. '
+                    'Measuring elapsed time there would let the same snippet pass on one execution '
+                    'and time out on another, changing the workflow history. Bound long-running '
+                    'sandbox loops in the snippets themselves; `max_memory` and `max_tool_calls` '
+                    'still apply.',
+                    category=RuntimeWarning,
+                    stacklevel=2,
+                )
         run_state = _MontyRunState()
         await self.wrapped.__aenter__()
         self._run_state = run_state
@@ -543,20 +910,42 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
         nested_calls: dict[str, ToolCallPart] = {}
         nested_returns: dict[str, ToolReturnPart] = {}
         call_counter = 0
+        budget_exhausted = False
 
-        async def dispatch_tool_call(sandbox_name: str, kwargs: dict[str, Any]) -> Any:
-            """Dispatch a single tool call from inside the sandbox.
+        def dispatch_tool_call(sandbox_name: str, kwargs: dict[str, Any]) -> Coroutine[Any, Any, Any]:
+            """Reserve nested-call budget, then build the coroutine that runs the call.
+
+            The reservation is synchronous because the executor turns each deferred call into an
+            `asyncio.Task` as soon as this returns, without yielding to the event loop in between.
+            Counting inside the coroutine would let one `asyncio.gather` over many calls allocate a
+            host task per call before the first check ran, which is the cost the budget bounds.
+            Refusing here means no task is created; the executor hands the error to the sandbox at
+            the call site, so calls that already completed keep their recorded results.
+            """
+            nonlocal call_counter, budget_exhausted
+            if call_counter >= self.max_tool_calls:
+                # Recorded so the retry can name the calls that already ran if the snippet does
+                # not catch this. Reaching the budget is not itself the failure: a snippet that
+                # handles the error still returns normally, carrying its metadata.
+                budget_exhausted = True
+                raise RuntimeError(
+                    f'Code mode allows {self.max_tool_calls} nested tool calls per `run_code` call '
+                    'and this snippet asked for more. Call fewer tools, for example by filtering '
+                    'the inputs first, or split the work across several `run_code` calls.'
+                )
+            call_counter += 1
+            parent_id = ctx.tool_call_id or 'pyd_ai_code_mode'
+            original_name = sanitized_to_original.get(sandbox_name, sandbox_name)
+            return run_tool_call(original_name, f'{parent_id}__{call_counter}', kwargs)
+
+        async def run_tool_call(original_name: str, tool_call_id: str, kwargs: dict[str, Any]) -> Any:
+            """Run a single tool call dispatched from inside the sandbox.
 
             Returns the serialized tool result on success. On failure, the
             exception propagates -- the execution loop passes it back into
             Monty via `ExternalException` so the sandbox sees it at the
             `await` site.
             """
-            nonlocal call_counter
-            original_name = sanitized_to_original.get(sandbox_name, sandbox_name)
-            call_counter += 1
-            parent_id = ctx.tool_call_id or 'pyd_ai_code_mode'
-            tool_call_id = f'{parent_id}__{call_counter}'
             call_part = ToolCallPart(tool_name=original_name, args=kwargs, tool_call_id=tool_call_id)
             nested_calls[tool_call_id] = call_part
 
@@ -612,7 +1001,11 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
         capture = PrintCapture()
 
         try:
-            session = run_state.get_session(type_check=type_check, type_check_stubs=type_check_stubs)
+            session = run_state.get_session(
+                type_check=type_check,
+                type_check_stubs=type_check_stubs,
+                limits=self._session_limits(),
+            )
             try:
                 monty_state = session.feed_start(
                     code,
@@ -652,7 +1045,28 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
             # ModelRetry from a wrapped tool gets double-wrapped
             # (ModelRetry → MontyRuntimeError → ModelRetry), but the retry
             # semantics are the same -- the model gets another chance.
-            raise ModelRetry(f'Runtime error:\n{capture.prepend_to(e.display())}') from e
+            message = f'Runtime error:\n{capture.prepend_to(e.display())}'
+            duration_spent = _is_duration_exhausted(e)
+            if nested_calls and (budget_exhausted or _exhausted_sandbox_limit(e) is not None):
+                # A retry is the only record the model gets of an uncaught failure, and these
+                # calls already started. Without them the model reruns their side effects when
+                # it retries. Asking which limit tripped, rather than testing one flag per limit,
+                # is what keeps a newly added limit from quietly losing this. It matters most on
+                # the duration path, where the advice is to restart, which discards the REPL state
+                # the model would otherwise reconstruct from.
+                message += f'\n\n{_describe_started_calls(nested_calls, nested_returns)}'
+            if duration_spent:
+                # This error keeps the session, so every later call fails on arrival too. Left
+                # alone it reads like an ordinary runtime error, which points the model at
+                # rewriting the snippet -- the one move that cannot work.
+                message += (
+                    '\n\nThe sandbox session has spent its whole `max_duration_secs` allowance, '
+                    'which every `run_code` call in the session shares, so later calls fail on '
+                    'arrival too and revising this code will not help. Pass `restart: true` to '
+                    'start a fresh session; that discards REPL state, so recreate anything you '
+                    'still need.'
+                )
+            raise ModelRetry(message) from e
         except MontyCrashedError as e:
             # The worker died mid-feed (e.g. the code exhausted its memory or hit the
             # request timeout) and the REPL state died with it; the pool replaces the

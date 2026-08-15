@@ -51,7 +51,7 @@ except ImportError:  # pragma: lax no cover
     pytest.skip('temporalio not installed', allow_module_level=True)
 
 from pydantic_ai import Agent, ToolDefinition
-from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, ToolCallPart, ToolReturnPart
+from pydantic_ai.messages import ModelRequest, ModelResponse, RetryPromptPart, TextPart, ToolCallPart, ToolReturnPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.toolsets.function import FunctionToolset
 
@@ -157,11 +157,54 @@ def _code_mode_model(messages: list[ModelRequest | ModelResponse], info: AgentIn
     )
 
 
+def _memory_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo) -> ModelResponse:
+    """Model that runs one allocating snippet and reports whatever came back, refusal or result.
+
+    It reports a successful return rather than calling again, so that a cap which failed to reach
+    the sandbox ends this test on its assertion instead of looping until the request limit.
+    """
+    parts = [part for msg in messages if isinstance(msg, ModelRequest) for part in msg.parts]
+    retries = [part for part in parts if isinstance(part, RetryPromptPart)]
+    if retries:
+        return ModelResponse(parts=[TextPart(content=f'retried: {retries[-1].content}')])
+    returns = [part for part in parts if isinstance(part, ToolReturnPart) and part.tool_name == 'run_code']
+    if returns:  # pragma: no cover -- only reachable when the cap is absent, which is the failure
+        return ModelResponse(parts=[TextPart(content=f'returned: {returns[-1].content}')])
+    return ModelResponse(
+        parts=[
+            ToolCallPart(
+                tool_name='run_code',
+                args={'code': 'x = [0] * 2_000_000\nlen(x)'},
+                tool_call_id='test_mem_1',
+            )
+        ]
+    )
+
+
 code_mode_agent = Agent(
     FunctionModel(_code_mode_model),
     name='code_mode_temporal_agent',
     toolsets=[FunctionToolset(tools=[add], id='math')],
+    # Default limits on purpose. Under Temporal, `CodeMode` drops `max_duration_secs` and keeps
+    # `max_memory`. The unit tests reach that decision through a monkeypatched `in_workflow()`;
+    # this file is where it goes through Temporal's own sandboxed module loading and replay.
+    # Configuring `resource_limits='unlimited'` here would clear both limits and leave none of it
+    # to run.
     capabilities=[CodeMode(), TemporalDurability(activity_config=BASE_ACTIVITY_CONFIG)],
+)
+
+
+# Same shape, with a memory cap small enough for a snippet to exceed. A partial `resource_limits`
+# merges onto the defaults, so this keeps the default duration cap and warns exactly as above --
+# there is no partial mapping that configures memory without it.
+memory_capped_agent = Agent(
+    FunctionModel(_memory_model),
+    name='code_mode_temporal_memory_agent',
+    toolsets=[FunctionToolset(tools=[add], id='math')],
+    capabilities=[
+        CodeMode(resource_limits={'max_memory': 8 * 1024 * 1024}),
+        TemporalDurability(activity_config=BASE_ACTIVITY_CONFIG),
+    ],
 )
 
 
@@ -174,6 +217,16 @@ class CodeModeWorkflow:
             'output': str(result.output),
             'messages': result.all_messages_json().decode(),
         }
+
+
+@workflow.defn
+class MemoryCappedWorkflow:
+    """Probe that `max_memory` is still enforced in workflow code, where the time cap is not."""
+
+    @workflow.run
+    async def run(self) -> str:
+        result = await memory_capped_agent.run('Allocate too much')
+        return str(result.output)
 
 
 @workflow.defn
@@ -194,6 +247,14 @@ class SandboxRestrictionWorkflow:
 # ---------------------------------------------------------------------------
 
 
+# Entering the toolset inside workflow code warns that `max_duration_secs` is being dropped, and
+# `filterwarnings = ['error']` would otherwise turn that into a workflow-task failure, which
+# Temporal retries forever -- the test hangs rather than fails. It is silenced rather than asserted
+# with `pytest.warns` because that does not reach the warning: `pytest.warns` records by mutating
+# filters at test runtime, and the workflow sandbox does not see the mutation, so the warning still
+# raises inside the workflow. A mark set before the sandbox exists does apply. That the warning
+# fires at all is covered by the unit tests; what this test adds is the limits themselves.
+@pytest.mark.filterwarnings('ignore::RuntimeWarning')
 async def test_code_mode_runs_in_temporal_workflow(client: Client) -> None:
     """CodeMode runs workflow-side, nested tools use activities, and the history replays."""
     _captured_tool_defs.clear()
@@ -297,3 +358,29 @@ async def test_code_mode_runs_in_temporal_workflow(client: Client) -> None:
         workflow_runner=_workflow_runner(),
     ).replay_workflow(history)
     assert replay_result.replay_failure is None
+
+
+@pytest.mark.filterwarnings('ignore::RuntimeWarning')
+async def test_memory_cap_still_applies_in_temporal_workflow(client: Client) -> None:
+    """`max_memory` survives into workflow code, which is the other half of dropping the time cap.
+
+    The unit tests establish this from a monkeypatched `in_workflow()`. Running it through a real
+    workflow is what shows the limit reaching Monty after Temporal has re-imported the modules, so
+    the selective drop is not merely decided correctly but applied.
+    """
+    async with Worker(
+        client,
+        task_queue=TASK_QUEUE,
+        workflows=[MemoryCappedWorkflow],
+        plugins=[AgentPlugin(memory_capped_agent)],
+        workflow_runner=_workflow_runner(),
+    ):
+        output = await client.execute_workflow(
+            MemoryCappedWorkflow.run,
+            id='test_code_mode_temporal_memory',
+            task_queue=TASK_QUEUE,
+        )
+
+    # The snippet allocated past the 8 MiB cap and Monty stopped it, rather than running to
+    # completion as it would with the limits cleared.
+    assert 'memory limit exceeded' in output
