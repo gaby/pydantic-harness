@@ -8,6 +8,7 @@ from pydantic_ai_harness.reviewer._capability import (
     DENIED_SHELL_OPERATORS,
     READ_ONLY_GIT_SUBCOMMANDS,
     SECRET_PATH_PATTERNS,
+    SHELL_COMMAND_TOOLS,
     Reviewer,
     review_command_guard,
 )
@@ -21,6 +22,7 @@ __all__ = [
     'DENIED_SHELL_OPERATORS',
     'READ_ONLY_GIT_SUBCOMMANDS',
     'SECRET_PATH_PATTERNS',
+    'SHELL_COMMAND_TOOLS',
     'Reviewer',
     'review_command_guard',
     'reviewer_agent',

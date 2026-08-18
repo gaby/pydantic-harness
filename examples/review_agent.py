@@ -48,6 +48,8 @@ REVIEW_COMMANDS = ('git', 'rg', 'grep', 'ls', 'cat', 'head', 'tail', 'wc', 'diff
 DENIED_OPERATORS = ('>', '|', ';', '&', '`', '$(', '\n')
 # `protected_patterns` gates writes only, so a read-only agent needs these denied.
 SECRET_PATTERNS = ('.env', '.env.*', '*.pem', '*.key', '**/secrets*')
+# Scoping the guardrail to the command tools also makes it warn if one is ever renamed.
+SHELL_COMMAND_TOOLS = ('run_command', 'start_command')
 
 
 def build_agent(model: Model | str = DEFAULT_MODEL, workspace: Path | None = None) -> Agent:
@@ -67,7 +69,7 @@ def build_agent(model: Model | str = DEFAULT_MODEL, workspace: Path | None = Non
                     denied_operators=DENIED_OPERATORS,
                     denied_env_patterns=LLM_API_KEY_ENV_PATTERNS,
                 ),
-                ToolGuardrail(guard=review_command_guard),
+                ToolGuardrail(guard=review_command_guard, tools=SHELL_COMMAND_TOOLS),
                 # The parent already carries the workspace instruction files.
                 RepoContext(workspace_dir=workspace, autoload_instructions=False),
                 ClearToolResults(max_fraction=0.7),
@@ -89,7 +91,7 @@ def build_agent(model: Model | str = DEFAULT_MODEL, workspace: Path | None = Non
                 denied_operators=DENIED_OPERATORS,
                 denied_env_patterns=LLM_API_KEY_ENV_PATTERNS,
             ),
-            ToolGuardrail(guard=review_command_guard),  # read-only `git`; refuses commands it cannot parse
+            ToolGuardrail(guard=review_command_guard, tools=SHELL_COMMAND_TOOLS),  # read-only `git` subcommands
             RepoContext(workspace_dir=workspace),  # loads AGENTS.md/CLAUDE.md + repo structure
             Planning(),  # structured review plans the model maintains
             SubAgents(agents=[inspector], agent_folders=None),  # delegate a file or area off the main context

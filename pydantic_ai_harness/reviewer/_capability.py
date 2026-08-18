@@ -106,19 +106,26 @@ Say so plainly when a change needs nothing.
 
 _INSPECTOR_INSTRUCTIONS = 'Report findings with concrete paths, line numbers, and the evidence you read.'
 
-_SHELL_COMMAND_TOOLS = frozenset({'run_command', 'start_command'})
+SHELL_COMMAND_TOOLS: tuple[str, ...] = ('run_command', 'start_command')
+"""`Shell` tools that take a command, for scoping the guardrail to them."""
+
+_GIT_SUBCOMMAND_REFUSAL = (
+    f'Only read-only `git` subcommands are available: {", ".join(sorted(READ_ONLY_GIT_SUBCOMMANDS))}. '
+    'Write `git <subcommand>` with no options before it.'
+)
+
+_INSPECTOR_DESCRIPTION = 'Review one file or area of the change and report findings with file and line references'
 
 
 def review_command_guard(call: ToolCallInfo) -> GuardrailResult:
     """Refuse shell commands the first-token allowlist would let through.
 
-    Two cases the allowlist cannot see: a `git` subcommand that writes, and
-    quoting that `shlex` rejects but `/bin/sh` accepts, which `Shell` treats as
-    "nothing to validate" and permits. Metacharacters are handled a layer down,
+    Two cases it cannot see: a `git` subcommand that writes, since every `git`
+    subcommand looks alike to a first-token check, and quoting that `shlex`
+    rejects but `/bin/sh` accepts, which `ShellToolset._check_command` treats as
+    "nothing to validate" and permits. Metacharacters are refused a layer down,
     by `Shell(denied_operators=DENIED_SHELL_OPERATORS)`.
     """
-    if call.name not in _SHELL_COMMAND_TOOLS:
-        return GuardrailResult.allow()
     command = call.args.get('command')
     if not isinstance(command, str):  # pragma: no cover - the toolset's own schema keeps this a string
         return GuardrailResult.allow()
@@ -128,33 +135,41 @@ def review_command_guard(call: ToolCallInfo) -> GuardrailResult:
     except ValueError:
         return GuardrailResult.block('That command is not quoted in a way this agent can check. Rewrite it.')
     if tokens[:1] == ['git'] and (len(tokens) < 2 or tokens[1] not in READ_ONLY_GIT_SUBCOMMANDS):
-        return GuardrailResult.block(
-            f'Only read-only `git` subcommands are available: {", ".join(sorted(READ_ONLY_GIT_SUBCOMMANDS))}. '
-            'Write `git <subcommand>` with no options before it.'
-        )
+        return GuardrailResult.block(_GIT_SUBCOMMAND_REFUSAL)
     return GuardrailResult.allow()
 
 
-def _review_shell(workspace: Path, commands: Sequence[str]) -> Shell[AgentDepsT]:
-    return Shell[AgentDepsT](
-        cwd=workspace,
-        allowed_commands=commands,
-        denied_operators=DENIED_SHELL_OPERATORS,
-        denied_env_patterns=LLM_API_KEY_ENV_PATTERNS,
-    )
+def _review_tools(
+    workspace: Path, commands: Sequence[str], instructions: str | None
+) -> list[AbstractCapability[AgentDepsT]]:
+    """The read-only surface both the reviewer and its delegate work through.
 
-
-def _review_filesystem(workspace: Path) -> FileSystem[AgentDepsT]:
-    return FileSystem[AgentDepsT](workspace, read_only=True, denied_patterns=SECRET_PATH_PATTERNS)
-
-
-def _inspector(workspace: Path, commands: Sequence[str], instructions: str | None) -> SubAgent[AgentDepsT]:
+    Built once so a delegate can never end up with a wider workspace than the
+    agent it reports to.
+    """
     capabilities: list[AbstractCapability[AgentDepsT]] = []
     if instructions is not None:
         capabilities.append(Capability[AgentDepsT](instructions=instructions))
-    capabilities.append(_review_filesystem(workspace))
+    capabilities.append(
+        FileSystem[AgentDepsT](workspace, read_only=True, denied_patterns=SECRET_PATH_PATTERNS),
+    )
     if commands:
-        capabilities.extend([_review_shell(workspace, commands), ToolGuardrail[AgentDepsT](guard=review_command_guard)])
+        capabilities.extend(
+            [
+                Shell[AgentDepsT](
+                    cwd=workspace,
+                    allowed_commands=commands,
+                    denied_operators=DENIED_SHELL_OPERATORS,
+                    denied_env_patterns=LLM_API_KEY_ENV_PATTERNS,
+                ),
+                ToolGuardrail[AgentDepsT](guard=review_command_guard, tools=SHELL_COMMAND_TOOLS),
+            ]
+        )
+    return capabilities
+
+
+def _inspector(workspace: Path, commands: Sequence[str], instructions: str | None) -> SubAgent[AgentDepsT]:
+    capabilities: list[AbstractCapability[AgentDepsT]] = _review_tools(workspace, commands, instructions)
     capabilities.extend(
         [
             # The parent already carries the workspace instruction files; re-reading them into
@@ -169,7 +184,7 @@ def _inspector(workspace: Path, commands: Sequence[str], instructions: str | Non
     )
     agent = Agent[AgentDepsT](  # pyright: ignore[reportCallIssue, reportArgumentType]
         name='inspector',
-        description='Review one file or area of the change and report findings with file and line references',
+        description=_INSPECTOR_DESCRIPTION,
         instructions=_INSPECTOR_INSTRUCTIONS,
         capabilities=capabilities,
     )
@@ -208,12 +223,7 @@ class Reviewer(CombinedCapability[AgentDepsT]):
         root = Path(workspace).expanduser()
         commands = tuple(DEFAULT_REVIEWER_COMMANDS if allowed_commands is None else allowed_commands)
         delegates = [_inspector(root, commands, instructions)] if subagents is None else subagents
-        capabilities: list[AbstractCapability[AgentDepsT]] = []
-        if instructions is not None:
-            capabilities.append(Capability[AgentDepsT](instructions=instructions))
-        capabilities.append(_review_filesystem(root))
-        if commands:
-            capabilities.extend([_review_shell(root, commands), ToolGuardrail[AgentDepsT](guard=review_command_guard)])
+        capabilities: list[AbstractCapability[AgentDepsT]] = _review_tools(root, commands, instructions)
         capabilities.extend(
             [
                 RepoContext[AgentDepsT](workspace_dir=root),

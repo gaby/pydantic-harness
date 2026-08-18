@@ -87,13 +87,16 @@ the harness's defaults out literally (instructions, command allowlists) instead 
 constants: the reader is meant to see the entire picture and copy-tweak it. It mirrors the
 exported agent (`coder_agent`, …) exactly, including its `name=` and identity `instructions=`.
 
-The Coder blown-out block lives on **five surfaces** that must stay identical:
+Each harness registers its blown-out surfaces in `_BLOWN_OUT_SURFACES` in
+`tests/test_docs_parity.py`, keyed by harness name. Coder's block lives on **five surfaces**:
 `docs/coder.md`, `docs/index.md`, `README.md`, `pydantic_ai_harness/coder/README.md`, and (as a
-parameterized module) `examples/coding_agent.py`. `tests/test_docs_parity.py` compares the four
-markdown copies byte-for-byte and checks the written-out allowlist against
-`DEFAULT_ALLOWED_COMMANDS`, so a change to any one of them fails CI until all move together —
-change the implementation, the pages, and the example in the same PR. Each block carries a
-keep-in-sync comment naming the surfaces.
+parameterized module) `examples/coding_agent.py`; Reviewer's lives on three (`docs/reviewer.md`,
+`pydantic_ai_harness/reviewer/README.md`, `examples/review_agent.py`). The test compares the
+markdown copies byte-for-byte and checks the written-out defaults against the constants the
+harness exports, so a change to any one of them fails CI until all move together: change the
+implementation, the pages, and the example in the same PR. Each block carries a keep-in-sync
+comment naming its surfaces, and a new harness adds a `_BLOWN_OUT_SURFACES` entry plus a
+`test_blown_out_example_matches_<harness>_defaults`.
 
 Style inside blown-out blocks: `capabilities=[...]` lists are always written one entry per line
 (never collapsed to a single line, including sub-agents'), and every entry in the main agent's

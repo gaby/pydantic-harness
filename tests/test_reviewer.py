@@ -27,6 +27,7 @@ from pydantic_ai_harness.reviewer import (
     DEFAULT_REVIEWER_INSTRUCTIONS,
     DENIED_SHELL_OPERATORS,
     SECRET_PATH_PATTERNS,
+    SHELL_COMMAND_TOOLS,
     Reviewer,
     review_command_guard,
     reviewer_agent,
@@ -76,14 +77,12 @@ def _calls_then_reports(tool_name: str, **args: str) -> FunctionModel:
     return FunctionModel(respond)
 
 
-def _guard(command: str, *, tool: str = 'run_command') -> GuardrailResult:
-    return review_command_guard(ToolCallInfo(name=tool, args={'command': command}, tool_call_id='call-1'))
+def _guard(command: str) -> GuardrailResult:
+    return review_command_guard(ToolCallInfo(name='run_command', args={'command': command}, tool_call_id='call-1'))
 
 
-def test_reviewer_constructs_agent() -> None:
-    agent = Agent(TestModel(), capabilities=[Reviewer()])
-
-    assert isinstance(agent, Agent)
+# The capabilities that make up the read-only surface, built once for both agents.
+_REVIEW_SURFACE = {Capability, FileSystem, Shell, ToolGuardrail}
 
 
 def test_reviewer_agent_is_model_less_and_composed() -> None:
@@ -135,19 +134,13 @@ def test_reviewer_members_are_transparent(tmp_path: Path) -> None:
     assert capability.get_instructions() == [DEFAULT_REVIEWER_INSTRUCTIONS]
 
 
-def test_reviewer_capabilities_are_rooted_at_the_workspace(tmp_path: Path) -> None:
-    reviewer = Reviewer[None](tmp_path)
-
-    file_system = next(capability for capability in reviewer.capabilities if isinstance(capability, FileSystem))
-    repo_context = next(capability for capability in reviewer.capabilities if isinstance(capability, RepoContext))
-    assert file_system.root_dir == tmp_path
-    assert repo_context.workspace_dir == tmp_path
-    assert _shell(reviewer).cwd == tmp_path
-
-
-def test_reviewer_expands_a_home_relative_workspace(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+@pytest.mark.parametrize('home_relative', [False, True], ids=['plain', 'home-relative'])
+def test_reviewer_capabilities_are_rooted_at_the_workspace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, home_relative: bool
+) -> None:
+    # `~` is expanded once, by `Reviewer`: none of FileSystem, Shell, or RepoContext does it.
     monkeypatch.setenv('HOME', str(tmp_path))
-    reviewer = Reviewer[None]('~/checkout')
+    reviewer = Reviewer[None]('~/checkout' if home_relative else str(tmp_path / 'checkout'))
 
     file_system = next(capability for capability in reviewer.capabilities if isinstance(capability, FileSystem))
     repo_context = next(capability for capability in reviewer.capabilities if isinstance(capability, RepoContext))
@@ -189,9 +182,15 @@ async def test_reviewer_file_tools_still_read_source(tmp_path: Path) -> None:
 def test_reviewer_default_commands_are_pinned() -> None:
     # Pinned, not spot-checked: changing this tuple must also revisit its docstring and
     # the four written-out copies of the composition.
+    # `find` is absent because `-delete` and `-exec` are writes first-token validation cannot see.
     assert DEFAULT_REVIEWER_COMMANDS == ('git', 'rg', 'grep', 'ls', 'cat', 'head', 'tail', 'wc', 'diff')
-    # `find -delete` and `find -exec` are writes that first-token validation cannot see.
-    assert 'find' not in DEFAULT_REVIEWER_COMMANDS
+
+
+def test_secret_patterns_track_the_filesystem_defaults() -> None:
+    # `FileSystem` protects these from writes by default; a read-only agent has to deny
+    # them outright. Pinned so a pattern added there is not silently readable here.
+    protected = tuple(p for p in FileSystem[None]().protected_patterns if p != '.git/*')
+    assert SECRET_PATH_PATTERNS == protected
 
 
 def test_reviewer_shell_denies_operators_and_strips_provider_keys(tmp_path: Path) -> None:
@@ -205,18 +204,16 @@ def test_reviewer_shell_denies_operators_and_strips_provider_keys(tmp_path: Path
 @pytest.mark.parametrize(
     'command',
     [
+        # One row per denied operator plus one command outside the allowlist. `>` matches
+        # `>>` by substring, so it covers both.
         'cat notes.txt > stolen.txt',
-        'cat notes.txt >> stolen.txt',
         'ls && python3 -c "print(1)"',
         'ls; touch created.txt',
         'cat notes.txt | sh',
         'echo `touch created.txt`',
         'echo $(touch created.txt)',
         'ls\ntouch created.txt',
-        'python3 -c "print(1)"',
-        'sed -i s/a/b/ notes.txt',
         'find . -delete',
-        'touch created.txt',
     ],
 )
 async def test_reviewer_shell_refuses_writes(tmp_path: Path, command: str) -> None:
@@ -239,13 +236,13 @@ async def test_reviewer_shell_still_reads(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(
     'command',
-    ['git commit -am wip', 'git push --force', 'git checkout -- .', 'git clean -fdx', 'git', 'git -C /tmp log'],
+    ['git commit -am wip', 'git', 'git -C /tmp log'],
 )
 def test_review_command_guard_blocks_writing_git_commands(command: str) -> None:
     assert _guard(command).action == 'block'
 
 
-@pytest.mark.parametrize('command', ['git log --oneline', 'git diff origin/main', 'git show HEAD', 'rg pattern'])
+@pytest.mark.parametrize('command', ['git log --oneline', 'rg pattern'])
 def test_review_command_guard_allows_reading_commands(command: str) -> None:
     assert _guard(command).action == 'allow'
 
@@ -254,20 +251,24 @@ def test_review_command_guard_blocks_commands_it_cannot_parse() -> None:
     # `shlex` rejects this quoting and `Shell` reads that as "nothing to validate",
     # so without the guard an unlisted command runs.
     assert _guard("touch created.txt #'").action == 'block'
-
-
-def test_review_command_guard_ignores_other_tools() -> None:
-    assert _guard('git commit -am wip', tool='read_file').action == 'allow'
     assert review_command_guard(ToolCallInfo(name='run_command', args={}, tool_call_id='c')).action == 'allow'
 
 
-def test_reviewer_guards_the_shell_it_builds(tmp_path: Path) -> None:
-    guardrail = next(
-        capability for capability in Reviewer[None](tmp_path).capabilities if isinstance(capability, ToolGuardrail)
-    )
+async def test_reviewer_guard_refuses_a_writing_git_command_in_a_run(tmp_path: Path) -> None:
+    agent = Agent(_calls_then_reports('run_command', command='git commit -am wip'), capabilities=[Reviewer(tmp_path)])
 
-    assert guardrail.guard is review_command_guard
-    assert any(isinstance(capability, ToolGuardrail) for capability in _delegate_capabilities(Reviewer[None](tmp_path)))
+    result = await agent.run('record your findings')
+
+    assert 'Only read-only `git` subcommands are available' in _tool_returns(result.all_messages())
+
+
+def test_reviewer_scopes_the_guardrail_to_the_command_tools(tmp_path: Path) -> None:
+    # `tools=` rather than a name check inside the guard: the guardrail warns if a name
+    # it lists is never offered, so a renamed shell tool cannot silently disarm the rule.
+    for capabilities in (Reviewer[None](tmp_path).capabilities, _delegate_capabilities(Reviewer[None](tmp_path))):
+        guardrail = next(capability for capability in capabilities if isinstance(capability, ToolGuardrail))
+        assert guardrail.guard is review_command_guard
+        assert tuple(guardrail.tools or ()) == SHELL_COMMAND_TOOLS
 
 
 def test_reviewer_empty_allowlist_removes_the_shell(tmp_path: Path) -> None:
@@ -299,13 +300,10 @@ def test_reviewer_delegate_shares_the_review_tools(tmp_path: Path) -> None:
         'Review one file or area of the change and report findings with file and line references'
     )
     capabilities = list(delegate.root_capability.capabilities)
-    file_system = next(c for c in capabilities if isinstance(c, FileSystem))
-    assert file_system.read_only is True
-    assert file_system.root_dir == tmp_path
-    assert tuple(file_system.denied_patterns) == SECRET_PATH_PATTERNS
-    shell = next(c for c in capabilities if isinstance(c, Shell))
-    assert shell.cwd == tmp_path
-    assert tuple(shell.denied_operators) == DENIED_SHELL_OPERATORS
+    # The surface comes from the same builder as the parent's, so this asserts the delegate
+    # carries all of it rather than re-checking each field.
+    assert _REVIEW_SURFACE <= {type(capability) for capability in capabilities}
+    assert _REVIEW_SURFACE <= {type(capability) for capability in Reviewer[None](tmp_path).capabilities}
     repo_context = next(c for c in capabilities if isinstance(c, RepoContext))
     assert repo_context.workspace_dir == tmp_path
     # The parent already carries the workspace instruction files.

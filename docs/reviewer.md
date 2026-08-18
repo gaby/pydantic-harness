@@ -42,7 +42,7 @@ It is literally these capabilities combined:
 - Concise default review instructions: see [Instructions](#instructions) below
 - [`FileSystem(read_only=True)`](filesystem.md): read, list, and search tools rooted at the workspace, path-traversal and symlink safe. No `write_file`, `edit_file`, or `create_directory` tool is exposed, and `.env`, `*.pem`, `*.key`, and `**/secrets*` are denied outright rather than merely protected from writes
 - [`Shell`](shell.md): a read-oriented allowlist (`DEFAULT_REVIEWER_COMMANDS`) rooted at the workspace, with shell operators refused and common LLM provider API-key variables filtered from inherited command environments
-- [`ToolGuardrail`](guardrails.md): `review_command_guard`, which limits `git` to the read-only subcommands in `READ_ONLY_GIT_SUBCOMMANDS` and refuses a command whose quoting it cannot parse
+- [`ToolGuardrail`](guardrails.md): `review_command_guard`, scoped to the shell command tools, limiting `git` to the read-only subcommands in `READ_ONLY_GIT_SUBCOMMANDS`
 - [`RepoContext`](repo-context.md): the `AGENTS.md`/`CLAUDE.md` conventions the change is reviewed against, plus repository structure
 - [`Planning`](planning.md): a plan the agent keeps current while it works through a large diff
 - [`SubAgents`](subagents.md): delegation, with an `inspector` sub-agent for one file or area by default
@@ -67,7 +67,7 @@ Four mechanisms hold the line, because first-token command validation on its own
 - the filesystem tools are filtered to the read-only set, so there is no write, edit, or create-directory tool to call;
 - `DEFAULT_REVIEWER_COMMANDS` (`git`, `rg`, `grep`, `ls`, `cat`, `head`, `tail`, `wc`, `diff`) contains no build, test, or edit commands. `find` is deliberately absent: `-delete` and `-exec` make it a write and execution primitive that a first-token check cannot tell from a search;
 - `Shell(denied_operators=...)` refuses `>`, `|`, `;`, `&`, backticks, `$(`, and newlines, so an allowed command cannot redirect into a file or pipe into an interpreter. The cost is that pipes and regex alternation (`rg 'a|b'`) are unavailable; run the steps as separate commands;
-- `review_command_guard` limits `git` to read-only subcommands (`log`, `diff`, `show`, `blame`, ...) and blocks any command whose quoting `shlex` rejects, which `Shell` would otherwise pass through unvalidated.
+- `review_command_guard` limits `git` to read-only subcommands (`log`, `diff`, `show`, `blame`, ...), the one rule first-token validation cannot express. A command `Shell` cannot parse is refused by `Shell` itself rather than run unvalidated.
 
 It is still a guardrail, not a security boundary. The shell reads any file the allowlisted commands can open, `cat .env` included, and an allowlisted binary can always do more than its name suggests. For review of untrusted branches, run the agent inside an OS-level sandbox such as [`ModalSandbox`](modal-sandbox.md) or a container.
 
@@ -164,6 +164,7 @@ Say so plainly when a change needs nothing.
 review_commands = ['git', 'rg', 'grep', 'ls', 'cat', 'head', 'tail', 'wc', 'diff']
 denied_operators = ['>', '|', ';', '&', '`', '$(', '\n']
 secret_patterns = ['.env', '.env.*', '*.pem', '*.key', '**/secrets*']
+shell_command_tools = ['run_command', 'start_command']
 
 inspector = SubAgent(
     Agent(
@@ -179,7 +180,7 @@ inspector = SubAgent(
                 denied_operators=denied_operators,
                 denied_env_patterns=LLM_API_KEY_ENV_PATTERNS,
             ),
-            ToolGuardrail(guard=review_command_guard),
+            ToolGuardrail(guard=review_command_guard, tools=shell_command_tools),
             RepoContext(workspace_dir=Path('.'), autoload_instructions=False),
             ClearToolResults(max_fraction=0.7),
             WarnNearLimits(max_context_fraction=0.9),
@@ -200,7 +201,7 @@ agent = Agent(
             denied_operators=denied_operators,
             denied_env_patterns=LLM_API_KEY_ENV_PATTERNS,
         ),
-        ToolGuardrail(guard=review_command_guard),  # read-only `git` subcommands; refuses commands it cannot parse
+        ToolGuardrail(guard=review_command_guard, tools=shell_command_tools),  # read-only `git` subcommands only
         RepoContext(workspace_dir=Path('.')),  # loads AGENTS.md/CLAUDE.md + repo structure
         Planning(),  # structured review plans the model maintains
         SubAgents(agents=[inspector], agent_folders=None),  # delegate a file or area off the main context
