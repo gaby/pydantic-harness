@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shlex
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -11,17 +12,17 @@ from pydantic_ai.tools import AgentDepsT
 
 from pydantic_ai_harness.compaction import ClearToolResults, WarnNearLimits
 from pydantic_ai_harness.filesystem import FileSystem
+from pydantic_ai_harness.guardrails import GuardrailResult, ToolCallInfo, ToolGuardrail
 from pydantic_ai_harness.planning import Planning
 from pydantic_ai_harness.repo_context import RepoContext
 from pydantic_ai_harness.shell import LLM_API_KEY_ENV_PATTERNS, Shell
 from pydantic_ai_harness.subagents import SubAgent, SubAgents
-from pydantic_ai_harness.tool_output_limits import ToolOutputLimits
+from pydantic_ai_harness.tool_output_limits import Band, ToolOutputLimits, Truncate
 
-DEFAULT_REVIEW_COMMANDS: tuple[str, ...] = (
+DEFAULT_REVIEWER_COMMANDS: tuple[str, ...] = (
     'git',
     'rg',
     'grep',
-    'find',
     'ls',
     'cat',
     'head',
@@ -31,9 +32,66 @@ DEFAULT_REVIEW_COMMANDS: tuple[str, ...] = (
 )
 """Commands available to `Reviewer` unless an explicit allowlist is supplied.
 
-Read-oriented: the review reaches the change through `git diff` and `git log`
-and searches the tree from there. No build, test, or edit commands are included,
-so a review that should run the test suite needs its own allowlist.
+Every entry reads. `find` is absent on purpose: `-delete` and `-exec` make it a
+write and execution primitive that first-token validation cannot distinguish
+from a search, and `find_files` covers the search. `git` is restricted further
+to the read-only subcommands in `READ_ONLY_GIT_SUBCOMMANDS`.
+
+A supplied allowlist replaces this one, and an empty one drops the shell
+entirely rather than disabling the check. `Shell` reads an empty allowlist as
+"no allowlist", which would hand a review agent an unrestricted shell.
+"""
+
+READ_ONLY_GIT_SUBCOMMANDS: frozenset[str] = frozenset(
+    {
+        'blame',
+        'cat-file',
+        'describe',
+        'diff',
+        'diff-index',
+        'diff-tree',
+        'for-each-ref',
+        'grep',
+        'log',
+        'ls-files',
+        'ls-remote',
+        'ls-tree',
+        'merge-base',
+        'name-rev',
+        'rev-list',
+        'rev-parse',
+        'shortlog',
+        'show',
+        'status',
+        'symbolic-ref',
+        'whatchanged',
+    }
+)
+"""`git` subcommands a review may run.
+
+An allowlist rather than a denylist of writing subcommands: `git` grows
+subcommands faster than this set can track them, and an unrecognized one should
+be refused rather than run.
+"""
+
+DENIED_SHELL_OPERATORS: tuple[str, ...] = ('>', '|', ';', '&', '`', '$(', '\n')
+"""Shell metacharacters `Reviewer` refuses in a command.
+
+Commands reach `/bin/sh` as a string while the allowlist only validates the
+first token, so without this every allowed command is a write primitive
+(`cat a > b`) and an execution primitive (`ls | sh`). Blocking the operators is
+what makes the allowlist mean what it says. The cost is that pipes and
+alternation (`rg 'a|b'`) are unavailable; run the steps as separate commands, or
+supply your own `Shell` from the blown-out form.
+"""
+
+SECRET_PATH_PATTERNS: tuple[str, ...] = ('.env', '.env.*', '*.pem', '*.key', '**/secrets*')
+"""Workspace paths the review's file tools refuse to read.
+
+`FileSystem.protected_patterns` covers the same paths but gates writes only, so
+under `read_only=True` it is inert: without this the reviewer reads every
+credential in the tree. The shell is a separate surface (`cat .env` still
+works), which is one more reason to review untrusted branches in a sandbox.
 """
 
 DEFAULT_REVIEWER_INSTRUCTIONS = """\
@@ -46,22 +104,74 @@ Say so plainly when a change needs nothing.
 """
 """Default instructions for `Reviewer`."""
 
+_INSPECTOR_INSTRUCTIONS = 'Report findings with concrete paths, line numbers, and the evidence you read.'
 
-def _inspector(workspace: str | Path, allowed_commands: Sequence[str]) -> SubAgent[AgentDepsT]:
+_SHELL_COMMAND_TOOLS = frozenset({'run_command', 'start_command'})
+
+
+def review_command_guard(call: ToolCallInfo) -> GuardrailResult:
+    """Refuse shell commands the first-token allowlist would let through.
+
+    Two cases the allowlist cannot see: a `git` subcommand that writes, and
+    quoting that `shlex` rejects but `/bin/sh` accepts, which `Shell` treats as
+    "nothing to validate" and permits. Metacharacters are handled a layer down,
+    by `Shell(denied_operators=DENIED_SHELL_OPERATORS)`.
+    """
+    if call.name not in _SHELL_COMMAND_TOOLS:
+        return GuardrailResult.allow()
+    command = call.args.get('command')
+    if not isinstance(command, str):  # pragma: no cover - the toolset's own schema keeps this a string
+        return GuardrailResult.allow()
+
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return GuardrailResult.block('That command is not quoted in a way this agent can check. Rewrite it.')
+    if tokens[:1] == ['git'] and (len(tokens) < 2 or tokens[1] not in READ_ONLY_GIT_SUBCOMMANDS):
+        return GuardrailResult.block(
+            f'Only read-only `git` subcommands are available: {", ".join(sorted(READ_ONLY_GIT_SUBCOMMANDS))}. '
+            'Write `git <subcommand>` with no options before it.'
+        )
+    return GuardrailResult.allow()
+
+
+def _review_shell(workspace: Path, commands: Sequence[str]) -> Shell[AgentDepsT]:
+    return Shell[AgentDepsT](
+        cwd=workspace,
+        allowed_commands=commands,
+        denied_operators=DENIED_SHELL_OPERATORS,
+        denied_env_patterns=LLM_API_KEY_ENV_PATTERNS,
+    )
+
+
+def _review_filesystem(workspace: Path) -> FileSystem[AgentDepsT]:
+    return FileSystem[AgentDepsT](workspace, read_only=True, denied_patterns=SECRET_PATH_PATTERNS)
+
+
+def _inspector(workspace: Path, commands: Sequence[str], instructions: str | None) -> SubAgent[AgentDepsT]:
+    capabilities: list[AbstractCapability[AgentDepsT]] = []
+    if instructions is not None:
+        capabilities.append(Capability[AgentDepsT](instructions=instructions))
+    capabilities.append(_review_filesystem(workspace))
+    if commands:
+        capabilities.extend([_review_shell(workspace, commands), ToolGuardrail[AgentDepsT](guard=review_command_guard)])
+    capabilities.extend(
+        [
+            # The parent already carries the workspace instruction files; re-reading them into
+            # every delegation duplicates them in an uncached prefix.
+            RepoContext[AgentDepsT](workspace_dir=workspace, autoload_instructions=False),
+            ClearToolResults[AgentDepsT](max_fraction=0.7),
+            WarnNearLimits[AgentDepsT](max_context_fraction=0.9),
+            # Truncate rather than the default spill: a delegation's handles die with its run,
+            # so a spilled file is unreadable the moment the inspector reports back.
+            ToolOutputLimits[AgentDepsT](bands=[Band(over=10_000, action=Truncate())]),
+        ]
+    )
     agent = Agent[AgentDepsT](  # pyright: ignore[reportCallIssue, reportArgumentType]
         name='inspector',
         description='Review one file or area of the change and report findings with file and line references',
-        instructions='Report findings with concrete paths, line numbers, and the evidence you read.',
-        capabilities=[
-            FileSystem[AgentDepsT](workspace, read_only=True),
-            Shell[AgentDepsT](
-                cwd=workspace,
-                allowed_commands=allowed_commands,
-                denied_env_patterns=LLM_API_KEY_ENV_PATTERNS,
-            ),
-            RepoContext[AgentDepsT](workspace_dir=Path(workspace)),
-            ToolOutputLimits[AgentDepsT](),
-        ],
+        instructions=_INSPECTOR_INSTRUCTIONS,
+        capabilities=capabilities,
     )
     return SubAgent(agent)
 
@@ -72,10 +182,16 @@ class Reviewer(CombinedCapability[AgentDepsT]):
     See the class definition and [Reviewer docs](https://pydantic.dev/docs/ai/harness/reviewer/) for the exact
     composition.
 
-    The agent reads the workspace and runs read-oriented commands; it gets no file write, edit, or delete tools.
-    That is a guardrail against accidental edits, not a write boundary: command validation checks only the first
-    token, so `git` reaches subcommands that write. Review untrusted branches inside an OS-level sandbox such as
-    `ModalSandbox` or a container.
+    The agent reads the workspace and runs read-oriented commands. It gets no file write or edit tools, secrets
+    (`.env`, `*.pem`, `*.key`, `**/secrets*`) are unreadable, shell metacharacters are refused so an allowed command
+    cannot redirect or chain into a write, and `git` is limited to read-only subcommands. That is a guardrail against
+    a review that edits, not a security boundary: the shell still reads any file the allowlisted commands can open,
+    and an allowlisted binary can do more than its name suggests. Review untrusted branches inside an OS-level
+    sandbox such as `ModalSandbox` or a container.
+
+    `RepoContext` loads the workspace's `AGENTS.md`/`CLAUDE.md` into the agent's instructions, and the default
+    instructions tell the model to review against them. On a branch you do not trust, those files are part of the
+    change under review: pass `instructions=` of your own, or drop `RepoContext` from the blown-out form.
 
     It comes with concise default instructions. Pass `instructions=` to replace them, or `instructions=None` to run
     with no default instructions.
@@ -89,20 +205,18 @@ class Reviewer(CombinedCapability[AgentDepsT]):
         subagents: Sequence[SubAgent[AgentDepsT]] | None = None,
         instructions: str | None = DEFAULT_REVIEWER_INSTRUCTIONS,
     ) -> None:
-        commands = DEFAULT_REVIEW_COMMANDS if allowed_commands is None else allowed_commands
-        delegates = [_inspector(workspace, commands)] if subagents is None else subagents
+        root = Path(workspace).expanduser()
+        commands = tuple(DEFAULT_REVIEWER_COMMANDS if allowed_commands is None else allowed_commands)
+        delegates = [_inspector(root, commands, instructions)] if subagents is None else subagents
         capabilities: list[AbstractCapability[AgentDepsT]] = []
         if instructions is not None:
             capabilities.append(Capability[AgentDepsT](instructions=instructions))
+        capabilities.append(_review_filesystem(root))
+        if commands:
+            capabilities.extend([_review_shell(root, commands), ToolGuardrail[AgentDepsT](guard=review_command_guard)])
         capabilities.extend(
             [
-                FileSystem[AgentDepsT](workspace, read_only=True),
-                Shell[AgentDepsT](
-                    cwd=workspace,
-                    allowed_commands=commands,
-                    denied_env_patterns=LLM_API_KEY_ENV_PATTERNS,
-                ),
-                RepoContext[AgentDepsT](workspace_dir=Path(workspace)),
+                RepoContext[AgentDepsT](workspace_dir=root),
                 Planning[AgentDepsT](),
             ]
         )
@@ -110,7 +224,9 @@ class Reviewer(CombinedCapability[AgentDepsT]):
             capabilities.append(SubAgents[AgentDepsT](agents=delegates, agent_folders=None))
         capabilities.extend(
             [
-                ClearToolResults[AgentDepsT](max_fraction=0.7),
+                # The delegates' findings are this agent's deliverable, not scratch work:
+                # clearing them would erase the review before it is written.
+                ClearToolResults[AgentDepsT](max_fraction=0.7, exclude_tools=frozenset({'delegate_task'})),
                 WarnNearLimits[AgentDepsT](max_context_fraction=0.9),
                 ToolOutputLimits[AgentDepsT](),
             ]

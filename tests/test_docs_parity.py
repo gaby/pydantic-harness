@@ -9,6 +9,7 @@ prose match the code as written) is a review-time concern, not a unit test.
 
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 
@@ -331,16 +332,25 @@ def test_capability_readme_links_source(package: Path) -> None:
     )
 
 
-# The Coder blown-out example is repeated on four markdown surfaces (plus, parameterized,
-# in examples/coding_agent.py). They must stay byte-identical so no page drifts from what
-# `coder_agent` actually is; see agent_docs/docs-conventions.md.
+# Each harness's blown-out example is repeated across markdown surfaces (plus, parameterized,
+# in its examples/ counterpart). They must stay byte-identical so no page drifts from what
+# the exported agent actually is; see agent_docs/docs-conventions.md.
 _BLOWN_OUT_MARKER = '<!-- Keep this blown-out example in sync across'
-_BLOWN_OUT_SURFACES = (
-    'docs/coder.md',
-    'docs/index.md',
-    'README.md',
-    'pydantic_ai_harness/coder/README.md',
-)
+_BLOWN_OUT_SURFACES = {
+    'coder': (
+        'docs/coder.md',
+        'docs/index.md',
+        'README.md',
+        'pydantic_ai_harness/coder/README.md',
+    ),
+    'reviewer': (
+        'docs/reviewer.md',
+        'pydantic_ai_harness/reviewer/README.md',
+    ),
+}
+_BLOWN_OUT_COPIES = [
+    (harness, surface) for harness, surfaces in _BLOWN_OUT_SURFACES.items() for surface in surfaces[1:]
+]
 
 
 def _blown_out_block(path: Path) -> str:
@@ -352,11 +362,12 @@ def _blown_out_block(path: Path) -> str:
     return match.group(1)
 
 
-@pytest.mark.parametrize('surface', _BLOWN_OUT_SURFACES[1:])
-def test_blown_out_example_is_identical_across_surfaces(surface: str) -> None:
-    canonical = _blown_out_block(_ROOT / _BLOWN_OUT_SURFACES[0])
+@pytest.mark.parametrize(('harness', 'surface'), _BLOWN_OUT_COPIES, ids=lambda value: value)
+def test_blown_out_example_is_identical_across_surfaces(harness: str, surface: str) -> None:
+    first = _BLOWN_OUT_SURFACES[harness][0]
+    canonical = _blown_out_block(_ROOT / first)
     assert _blown_out_block(_ROOT / surface) == canonical, (
-        f'{surface} blown-out example differs from {_BLOWN_OUT_SURFACES[0]}; '
+        f'{surface} blown-out example differs from {first}; '
         'update all surfaces named in the keep-in-sync comment together.'
     )
 
@@ -364,7 +375,7 @@ def test_blown_out_example_is_identical_across_surfaces(surface: str) -> None:
 def test_blown_out_example_matches_coder_defaults() -> None:
     from pydantic_ai_harness.coder import DEFAULT_ALLOWED_COMMANDS
 
-    block = _blown_out_block(_ROOT / _BLOWN_OUT_SURFACES[0])
+    block = _blown_out_block(_ROOT / _BLOWN_OUT_SURFACES['coder'][0])
     listed = re.findall(r"'([a-z]+)'", block.split('allowed_commands = [', 1)[1].split(']', 1)[0])
     assert tuple(listed) == tuple(DEFAULT_ALLOWED_COMMANDS), (
         'the written-out allowlist no longer matches pydantic_ai_harness.coder.DEFAULT_ALLOWED_COMMANDS'
@@ -378,3 +389,34 @@ def test_blown_out_example_matches_coder_defaults() -> None:
     assert identity in example and 'denied_env_patterns=LLM_API_KEY_ENV_PATTERNS' in example, (
         'examples/coding_agent.py drifted from the coder_agent composition'
     )
+
+
+def test_blown_out_example_matches_reviewer_defaults() -> None:
+    from pydantic_ai_harness.reviewer import (
+        DEFAULT_REVIEWER_COMMANDS,
+        DEFAULT_REVIEWER_INSTRUCTIONS,
+        DENIED_SHELL_OPERATORS,
+        SECRET_PATH_PATTERNS,
+    )
+
+    block = _blown_out_block(_ROOT / _BLOWN_OUT_SURFACES['reviewer'][0])
+    example = (_ROOT / 'examples/review_agent.py').read_text(encoding='utf-8')
+    listed = {
+        'review_commands': DEFAULT_REVIEWER_COMMANDS,
+        'denied_operators': DENIED_SHELL_OPERATORS,
+        'secret_patterns': SECRET_PATH_PATTERNS,
+    }
+    for name, expected in listed.items():
+        written = ast.literal_eval(block.split(f'{name} = ', 1)[1].split('\n', 1)[0])
+        assert tuple(written) == tuple(expected), (
+            f'the written-out {name} no longer matches pydantic_ai_harness.reviewer'
+        )
+    assert DEFAULT_REVIEWER_INSTRUCTIONS in block, (
+        'the blown-out example must carry DEFAULT_REVIEWER_INSTRUCTIONS verbatim'
+    )
+    assert DEFAULT_REVIEWER_INSTRUCTIONS in example, (
+        'examples/review_agent.py drifted from DEFAULT_REVIEWER_INSTRUCTIONS'
+    )
+    for name, expected in listed.items():
+        written = ast.literal_eval(example.split(f'{name.upper()} = ', 1)[1].split('\n', 1)[0])
+        assert tuple(written) == tuple(expected), f'examples/review_agent.py drifted from {name}'

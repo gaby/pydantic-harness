@@ -132,13 +132,13 @@ Every capability is a self-contained unit you drop into `capabilities=[...]`, an
 
 ### Harnesses
 
-Complete agent stacks as regular combined capabilities: one import gives you a working agent, and you can take either apart into the blocks below.
+Complete agent stacks as regular combined capabilities: one import gives you a working agent, and you can take any of them apart into the blocks below.
 
 | Harness | Package | What it provides |
 |---|---|---|
 | [Coder](pydantic_ai_harness/coder/) | Harness | A complete coding-agent stack: files, shell, repo context, planning, a read-only explorer sub-agent, and context controls |
 | [Researcher](pydantic_ai_harness/researcher/) | Harness | A complete web-research stack: search, page fetching, a delegated sub-researcher, and bounded tool output |
-| [Reviewer](pydantic_ai_harness/reviewer/) | Harness | A complete code-review stack: a read-only workspace, read-oriented shell, repo context, planning, an `inspector` sub-agent, and context controls |
+| [Reviewer](pydantic_ai_harness/reviewer/) | Harness | A complete code-review stack: a read-only workspace with secrets withheld, a shell that cannot write, repo context, planning, an `inspector` sub-agent, and context controls |
 
 ### Execution environments
 
