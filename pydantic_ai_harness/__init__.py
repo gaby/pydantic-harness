@@ -45,6 +45,7 @@ if TYPE_CHECKING:
     from .pydantic_ai_docs import PydanticAIDocs
     from .repo_context import RepoContext
     from .researcher import DEFAULT_RESEARCHER_INSTRUCTIONS, Researcher
+    from .reviewer import DEFAULT_REVIEW_COMMANDS, DEFAULT_REVIEWER_INSTRUCTIONS, Reviewer
     from .shell import LLM_API_KEY_ENV_PATTERNS, Shell
     from .skills import Skills
     from .spend import SpendLimits
@@ -66,6 +67,8 @@ __all__ = [
     'ConversationSearch',
     'DEFAULT_ALLOWED_COMMANDS',
     'DEFAULT_RESEARCHER_INSTRUCTIONS',
+    'DEFAULT_REVIEWER_INSTRUCTIONS',
+    'DEFAULT_REVIEW_COMMANDS',
     'DeduplicateFileReads',
     'DynamicWorkflow',
     'ExaAgent',
@@ -93,6 +96,7 @@ __all__ = [
     'ReportContextUsage',
     'RepoContext',
     'Researcher',
+    'Reviewer',
     'Shell',
     'Skills',
     'SlidingWindowCompaction',
@@ -135,6 +139,7 @@ _CAPABILITY_EXPORTS = {
     'ReportContextUsage': 'compaction',
     'RepoContext': 'repo_context',
     'Researcher': 'researcher',
+    'Reviewer': 'reviewer',
     'Shell': 'shell',
     'Skills': 'skills',
     'SlidingWindowCompaction': 'compaction',
@@ -154,6 +159,8 @@ _CAPABILITY_EXPORTS = {
 _CONSTANT_EXPORTS = {
     'DEFAULT_ALLOWED_COMMANDS': 'coder',
     'DEFAULT_RESEARCHER_INSTRUCTIONS': 'researcher',
+    'DEFAULT_REVIEWER_INSTRUCTIONS': 'reviewer',
+    'DEFAULT_REVIEW_COMMANDS': 'reviewer',
     'LLM_API_KEY_ENV_PATTERNS': 'shell',
     'READ_ONLY_TOOL_NAMES': 'filesystem',
     'SubAgent': 'subagents',

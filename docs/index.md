@@ -11,7 +11,7 @@ description: "Your agent's favorite harness, built on Pydantic AI: 30+ capabilit
 
 **Pydantic AI Harness** is the official [capability](/ai/capabilities/overview/) and harness library for [Pydantic AI](/ai/). Every Pydantic AI agent already has a light harness: the typed agent loop, [any model](/ai/models/overview/), your own tools, structured output. For simple agents that's enough. But set an agent loose on complex, long-running work (fix a codebase, research a question, run for hours unattended) and what it needs around the model grows: a [workspace](filesystem.md) to act in, a [plan](planning.md) it keeps current, [memory](memory.md) that carries across sessions, [sub-agents](subagents.md) to hand work to, [context management](compaction.md) that holds up in hour ten, and [durable execution](/ai/capabilities/durable_execution/overview/) that survives a restart. **Pydantic AI Harness** ships that harness.
 
-Everything here is one primitive: a [capability](/ai/capabilities/overview/), a self-contained unit of agent behavior you add to `capabilities=[...]` on any agent. There are [30+ of them](#capabilities), and complete agents like [Coder](coder.md) and [Researcher](researcher.md) are themselves capabilities combined: they come apart the way they went together. Snap on a single block, compose your own stack, or start from the whole coding agent and take it apart later.
+Everything here is one primitive: a [capability](/ai/capabilities/overview/), a self-contained unit of agent behavior you add to `capabilities=[...]` on any agent. There are [30+ of them](#capabilities), and complete agents like [Coder](coder.md), [Researcher](researcher.md), and [Reviewer](reviewer.md) are themselves capabilities combined: they come apart the way they went together. Snap on a single block, compose your own stack, or start from the whole coding agent and take it apart later.
 
 ## Quick start
 
@@ -137,6 +137,7 @@ Complete agent stacks as regular combined capabilities: one import gives you a w
 |---|---|---|
 | [Coder](coder.md) | Harness | A complete coding-agent stack: files, shell, repo context, planning, a read-only explorer sub-agent, and context controls |
 | [Researcher](researcher.md) | Harness | A complete web-research stack: search, page fetching, a delegated sub-researcher, and bounded tool output |
+| [Reviewer](reviewer.md) | Harness | A complete code-review stack: a read-only workspace, read-oriented shell, repo context, planning, an `inspector` sub-agent, and context controls |
 
 ### Execution environments
 

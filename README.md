@@ -12,7 +12,7 @@
 
 **Pydantic AI Harness** is the official [capability](https://ai.pydantic.dev/capabilities/overview/) and harness library for [Pydantic AI](https://ai.pydantic.dev/). Every Pydantic AI agent already has a light harness: the typed agent loop, [any model](https://ai.pydantic.dev/models/), your own tools, structured output. For simple agents that's enough. But set an agent loose on complex, long-running work (fix a codebase, research a question, run for hours unattended) and what it needs around the model grows: a [workspace](pydantic_ai_harness/filesystem/) to act in, a [plan](pydantic_ai_harness/planning/) it keeps current, [memory](pydantic_ai_harness/memory/) that carries across sessions, [sub-agents](pydantic_ai_harness/subagents/) to hand work to, [context management](pydantic_ai_harness/compaction/) that holds up in hour ten, and [durable execution](https://ai.pydantic.dev/capabilities/durable_execution/overview/) that survives a restart. **Pydantic AI Harness** ships that harness.
 
-Everything here is one primitive: a [capability](https://ai.pydantic.dev/capabilities/), a self-contained unit of agent behavior you add to `capabilities=[...]` on any agent. There are [30+ of them](#capabilities), and complete agents like [Coder](pydantic_ai_harness/coder/) and [Researcher](pydantic_ai_harness/researcher/) are themselves capabilities combined: they come apart the way they went together. Snap on a single block, compose your own stack, or start from the whole coding agent and take it apart later.
+Everything here is one primitive: a [capability](https://ai.pydantic.dev/capabilities/), a self-contained unit of agent behavior you add to `capabilities=[...]` on any agent. There are [30+ of them](#capabilities), and complete agents like [Coder](pydantic_ai_harness/coder/), [Researcher](pydantic_ai_harness/researcher/), and [Reviewer](pydantic_ai_harness/reviewer/) are themselves capabilities combined: they come apart the way they went together. Snap on a single block, compose your own stack, or start from the whole coding agent and take it apart later.
 
 ## Quick start
 
@@ -138,6 +138,7 @@ Complete agent stacks as regular combined capabilities: one import gives you a w
 |---|---|---|
 | [Coder](pydantic_ai_harness/coder/) | Harness | A complete coding-agent stack: files, shell, repo context, planning, a read-only explorer sub-agent, and context controls |
 | [Researcher](pydantic_ai_harness/researcher/) | Harness | A complete web-research stack: search, page fetching, a delegated sub-researcher, and bounded tool output |
+| [Reviewer](pydantic_ai_harness/reviewer/) | Harness | A complete code-review stack: a read-only workspace, read-oriented shell, repo context, planning, an `inspector` sub-agent, and context controls |
 
 ### Execution environments
 

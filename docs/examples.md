@@ -15,9 +15,10 @@ code and tweak it, without chasing imports.
 |---|---|
 | `coding_agent.py` | A coding agent for the current repo, built from the blocks that make up [`Coder`](coder.md) |
 | `research_agent.py` | A web-research agent that cites every claim, built from the blocks that make up [`Researcher`](researcher.md) |
+| `review_agent.py` | A read-only code-review agent that reports findings, built from the blocks that make up [`Reviewer`](reviewer.md) |
 
 If you just want the assembled version, every packaged harness ([`Coder`](coder.md),
-[`Researcher`](researcher.md), …) is one import, or zero, via the
+[`Researcher`](researcher.md), [`Reviewer`](reviewer.md), …) is one import, or zero, via the
 [CLI](https://pydantic.dev/docs/ai/cli/#custom-agents):
 
 ```bash

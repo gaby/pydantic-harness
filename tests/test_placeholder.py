@@ -57,10 +57,11 @@ def test_lazy_import_shell():
 
 
 def test_lazy_import_presets():
-    from pydantic_ai_harness import Coder, Researcher
+    from pydantic_ai_harness import Coder, Researcher, Reviewer
 
     assert inspect.isclass(Coder)
     assert inspect.isclass(Researcher)
+    assert inspect.isclass(Reviewer)
 
 
 def test_lazy_import_llm_api_key_env_patterns():

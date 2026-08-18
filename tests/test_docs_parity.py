@@ -130,6 +130,7 @@ _CAPABILITY_PAGE_META = {
     'modal-sandbox.md': ('modal_sandbox', 'Modal Sandbox'),
     'repo-context.md': ('repo_context', 'Repo Context'),
     'researcher.md': ('researcher', 'Researcher'),
+    'reviewer.md': ('reviewer', 'Reviewer'),
     'pydantic-ai-docs.md': ('pydantic_ai_docs', 'Pydantic AI Docs'),
     'exa-search.md': ('exa', 'Exa Search'),
     'macroscope.md': ('macroscope', 'Macroscope'),
