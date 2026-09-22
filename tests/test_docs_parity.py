@@ -159,6 +159,7 @@ _CAPABILITY_PAGE_META = {
     'spend.md': ('spend', 'Spend'),
     'localstack.md': ('localstack', 'LocalStack'),
     'stackone.md': ('stackone', 'StackOne'),
+    'xberg.md': ('xberg', 'Xberg'),
     'acp.md': ('experimental/acp', 'ACP (Agent Client Protocol)'),
 }
 

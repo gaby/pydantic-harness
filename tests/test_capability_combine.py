@@ -315,6 +315,10 @@ COMBINE_POLICY: dict[str, Policy] = {
     'ModalSandbox': Collides('its toolset registers `run_command` and friends under fixed names'),
     'ConversationSearch': Collides('its toolset registers `search_conversation_history` under a fixed name'),
     'ExaAgent': Collides('its toolset registers `web_search` and friends under fixed names'),
+    'Xberg': Collides(
+        'its toolset registers `extract` and friends under fixed names',
+        lambda cls: (cls(url='http://127.0.0.1:8000'), cls(url='http://127.0.0.1:8001')),
+    ),
     'ExaSearch': Collides('its toolset registers `web_search` and friends under fixed names'),
     'YouResearch': Collides('its toolset registers `research` and friends under fixed names'),
     'YouSearch': Collides('its toolset registers `web_search` and friends under fixed names'),

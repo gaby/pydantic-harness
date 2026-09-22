@@ -48,6 +48,7 @@ _FACTORIES = (
     ('tool_output_limits', 'tool_output_limits:ToolOutputLimits'),
     ('trajectory_judge', 'trajectory_judge:TrajectoryJudge'),
     ('warn_on_cache_busts', 'warn_on_cache_busts:WarnOnCacheBusts'),
+    ('xberg', 'xberg:Xberg'),
     ('you_search', 'youdotcom:YouSearch'),
     ('you_research', 'youdotcom:YouResearch'),
 )

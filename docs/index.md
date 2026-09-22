@@ -115,6 +115,7 @@ Connections to systems outside the agent's workspace, and abilities the provider
 | [StackOne](stackone.md) | Harness | Act on linked SaaS accounts (HRIS, ATS, CRM, …) via [StackOne](https://www.stackone.com) |
 | [LocalStack](localstack.md) | Harness | An emulated AWS environment with AWS CLI tools |
 | [Macroscope](macroscope.md) | Harness | Run a local [Macroscope](https://docs.macroscope.com/cli) code review and hand the findings to the agent |
+| [Xberg](xberg.md) | Harness | Read PDFs, Office files, images, audio, and archives through an [Xberg](https://xberg.io) document extraction server |
 
 ### Web & research
 
