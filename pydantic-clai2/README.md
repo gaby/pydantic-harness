@@ -12,6 +12,16 @@ Context management is the built-in `compaction` plugin,
 The `/plugins` menu also lists every other harness capability, disabled by
 default. Press Space to enable one. Some need optional packages, credentials,
 or constructor settings first; see [optional harness capabilities](PLUGINS.md#optional-harness-capabilities).
+The built-in `mcp` plugin includes the MCP client and `/mcp` command. Configure
+trusted stdio or Streamable HTTP servers through plugin settings; no server is
+connected by default. `/mcp` lists configuration, and `/mcp tools NAME` connects
+briefly to discover tools. HTTP redirects are rejected; use the final endpoint URL.
+During runs, core manages connections and prefixes
+tool names with the configured server name. Local server programs still need to
+be installed separately. Settings are plain JSON, so avoid storing secrets there.
+See [Connect MCP servers](PLUGINS.md#connect-mcp-servers) for configuration and
+trust guidance. `/plugins disable mcp` removes its command and tools.
+
 Python 3.11+ is required by Termflow. Tracking issue: https://github.com/pydantic/pydantic-ai-harness/issues/875.
 
 CLAI file tools can access paths outside the workspace, including `/tmp`, and do
@@ -27,6 +37,15 @@ Use `/set display.tool_output true` to show detailed output again, or
 `/set display.tool_output false` to return to summaries. In detailed mode,
 `display.shell_lines` and `display.grep_lines` limit previews to 20 lines by
 default. Plugin-provided rendering, including interactive questions, is unchanged.
+
+## Startup
+
+`clai2 --help` parses arguments without loading the agent or plugins. Interactive
+startup defers model menus and provider integrations until you open those menus,
+log in, or run a prompt. The first use can therefore take longer. Enabled plugins
+still load before the first prompt; their initialization contributes to startup time.
+`/login` offers both Codex and GitHub Copilot without loading their integrations for
+completion. Copilot requests use your saved login through the lazy provider resolver.
 
 ## Desktop notifications
 
@@ -281,6 +300,9 @@ no agent telemetry spans.
 
 ## Codex authentication
 
+The built-in model catalog and `/set model` completions include
+`openai-codex:gpt-6-sol` and `openai-codex:gpt-6-luna`.
+
 `/login openai-codex` opens the browser and uses core's `OpenAICodexOAuthFlow`:
 authorization code with PKCE, state validation, and a callback at
 `http://localhost:1455/auth/callback`. It times out after five minutes.
@@ -301,11 +323,16 @@ Installing or selecting a plaintext backend can store tokens in plaintext. Core 
 token refresh through CLAI's `OpenAICodexCredentialSource`. Tests mock keyring,
 the browser, and OAuth exchange and do not access real credentials.
 
+If Codex cannot refresh your login, CLAI tells you to run `/login openai-codex`
+in an interactive session, then retry your message. This replaces the generic
+connection error that can hide an expired login. Headless runs show the same
+advice on stderr and exit with code 1. CLAI does not retry the turn automatically.
+
 When no keyring backend exists at all (keyring raises `NoKeyringError` or
 `InitError`, typical on a headless Linux box or over SSH), credentials go to a
 `0600` file in `$XDG_CONFIG_HOME/pydantic-clai2/` (`~/.config/pydantic-clai2/` by
 default) instead, named for the account: Codex uses `credentials-openai-codex.json`,
-and the vllm and openrouter connections use their own files. Like keyring entries,
+and the GitHub Copilot, vllm and openrouter connections use their own files. Like keyring entries,
 these files are per user, so `--database PATH` does not move them. `/login` says so in its confirmation. A locked keyring is not treated as
 missing; unlock it instead. Once a keyring becomes available, the next login or
 token refresh moves the credentials there and deletes the file.
@@ -319,6 +346,48 @@ The requested default does not guarantee model availability for a subscription.
 Custom agents supplied to `chat` retain their model unless settings explicitly
 select an override. `/login` is async, and plugin command handlers may also return
 an awaitable string.
+
+## GitHub Copilot subscriptions
+
+```bash
+uv run clai2
+```
+
+In CLAI, run `/login github-copilot`, then open `/add_model` and choose
+`github-copilot`. The provider menu also starts login when no credentials exist.
+You do not need to register an OAuth application or configure a client ID.
+CLAI supplies the same [public Copilot OAuth client ID as Pi](https://github.com/earendil-works/pi/blob/fde38ed7c2f64434beffc6c0ec3b9994cb89ae23/packages/ai/src/auth/oauth/github-copilot.ts#L10-L11)
+and requests `read:user` access to your GitHub profile. This identifies the existing
+Copilot OAuth application, not a separately registered CLAI application.
+`GITHUB_COPILOT_CLIENT_ID` remains an optional override for your own device-enabled
+OAuth application; unset or blank uses the bundled default.
+The workspace temporarily pins the merged Pydantic AI device-flow implementation
+until it is released.
+
+Login prints a code and `https://github.com/login/device`, then starts polling.
+Open that link on this or another device and approve only the code shown by your
+own CLAI session. CLAI does not launch a browser, so a text browser cannot block
+login or take over your SSH terminal. Ctrl-C stops polling; GitHub controls the
+code's expiry. No localhost callback or pasted token is needed.
+
+GitHub authorization alone does not establish Copilot access. The model menu
+queries your account's catalog and lists only picker-enabled models with
+`/chat/completions` support. The shared model menu includes details and `Ctrl+S`
+settings. Your subscription and organization policy still control inference access.
+You can also select a known ID with `/add_model github-copilot:claude-haiku-4.5`.
+
+Credentials use the existing keyring backend under the `github-copilot` account,
+separate from Codex and API keys. Without a keyring, CLAI reports the plaintext
+`credentials-github-copilot.json` fallback file, created with mode `0600`.
+Tokens and their issuance time stay out of settings, history, and login output.
+Expiring tokens require `/login github-copilot` again; CLAI does not refresh them.
+A failed or cancelled authorization leaves the previous login unchanged.
+
+Without a saved login, CLAI accepts `GITHUB_COPILOT_API_KEY`,
+`GITHUB_COPILOT_API_TOKEN`, or `COPILOT_GITHUB_TOKEN`, in that order.
+It does not read `GH_TOKEN`, `GITHUB_TOKEN`, or another application's token files.
+Core owns inference and its telemetry; CLAI adds no login-specific spans.
+`/login` without a provider continues to sign in to Codex.
 
 ## Settings and commands
 
@@ -358,9 +427,11 @@ not change output-validation or HTTP transport retries.
 
 ## Models and their settings
 
-`/model` selects from models you have already added. Its flat, searchable picker
-and Tab completion use only that saved list. `/model NAME` switches directly to
-an added model. The currently configured model is kept in the list when upgrading.
+`/model` selects from models you have already added. Choose **Add a model...**
+to browse providers and select a new model without leaving the command. This
+option is available even when no models have been added. Tab completion uses
+only the saved list. `/model NAME` switches directly to an added model.
+The currently configured model is kept in the list when upgrading.
 
 `/add_model` opens a searchable provider list, then a model picker for that provider.
 Esc from the model list returns to providers. Providers are unique prefixes from
@@ -387,6 +458,16 @@ Tab completes added models.
 `Ctrl+S` in `/add_model` opens the same editor. Edits save immediately and apply
 on the next prompt. `r` resets a field; Esc or Ctrl-C goes back. Fixed choices
 open a picker; numeric fields accept typed values, and empty input resets.
+
+First add `openai-codex:gpt-6-astra` with `/add_model`, then open `/model_settings openai-codex:gpt-6-astra`
+(or your saved Codex model), then **Service Tier / Fast Mode**. Choose
+**Fast (priority)** to request fast processing, or **Standard (default)** to
+turn it off. [Codex fast mode](https://developers.openai.com/codex/speed)
+uses more ChatGPT credits and depends on model and account availability. It does
+not lower reasoning effort. Reset restores the existing model default; it does
+not enable fast mode. The stored values remain `service_tier=priority` and
+`service_tier=default`, so older CLAI versions can read them. A custom
+`service_tier` body parameter still takes precedence.
 
 Model preferences are shared across checkouts. Reading saved preferences ignores
 unknown fields, so newer settings do not break an older reader with this
@@ -568,10 +649,14 @@ paste of existing image paths creates attachments as described in
 [Pasting images](#pasting-images).
 
 Up/down move through multiline drafts, then recall saved prompt history.
-Enter submits a prompt when idle and steers the current run when busy. Steering
-reaches the model at its next opportunity without cancelling in-flight tools.
-Alt+Enter (Option+Enter) queues a separate follow-up turn; slash commands always
-wait until the current turn ends. While running, the input box shows both submit shortcuts.
+Enter submits a prompt when idle and queues a separate follow-up turn when busy.
+To steer instead, first queue the message with Enter, then press Alt+Enter
+(Option+Enter). This sends the oldest queued follow-up to the active run at its
+next opportunity without cancelling in-flight tools or changing your draft.
+Each Alt+Enter sends one message. If the run is no longer accepting steering,
+the message stays queued. Slash commands and exit signals are not steered or
+skipped over. With no queued message, Alt+Enter does nothing.
+While running, the input box shows both shortcuts.
 Shift-Enter inserts a newline. CLAI requests modified
 key reporting while the editor is active and releases it for menus and on exit.
 Ctrl-R searches history; Enter accepts a search
