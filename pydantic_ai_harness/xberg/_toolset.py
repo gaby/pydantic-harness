@@ -42,6 +42,7 @@ import math
 import os
 import re
 import stat
+import sys
 import traceback
 from collections.abc import AsyncGenerator, Awaitable, Callable, Collection, Generator, Mapping, Sequence
 from contextlib import contextmanager
@@ -158,7 +159,7 @@ _CLOSE_TIMEOUT = 5.0
 
 _UPLOAD_OPEN_FLAGS = os.O_BINARY if os.name == 'nt' else os.O_NONBLOCK | os.O_NOFOLLOW
 """`O_NOFOLLOW` refuses a symlink swapped in after the root check, and `O_NONBLOCK` keeps a swapped-in FIFO
-from waiting for a writer. Windows has neither hazard and gets `O_BINARY`."""
+from waiting for a writer. Windows has neither flag and gets `O_BINARY`; `_open_directly` checks the open there."""
 
 _EXTRACT_SPAN = 'xberg_extract'
 _DETECT_SPAN = 'xberg_detect'
@@ -874,12 +875,53 @@ def _open_walking(resolved: Path) -> int:
         os.close(directory)
 
 
-def _open_directly(resolved: Path) -> int:  # pragma: no cover
-    """Open `resolved` where `os.open` takes no `dir_fd` (Windows): the root check holds at resolution only."""
-    return os.open(resolved, os.O_RDONLY | _UPLOAD_OPEN_FLAGS)
+def _open_directly(resolved: Path) -> int:
+    """Open `resolved` where `os.open` takes no `dir_fd` (Windows), refusing it if the open landed elsewhere.
+
+    A symlink or junction swapped in after the root check would redirect the open, so the path the
+    platform reports for the open file has to still be the one checked.
+    """
+    descriptor = os.open(resolved, os.O_RDONLY | _UPLOAD_OPEN_FLAGS)
+    try:
+        if _comparable(_final_path(descriptor)) != _comparable(str(resolved)):
+            raise OSError(errno.ELOOP, 'The file moved after it was checked', str(resolved))
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
 
 
-_open_upload = _open_walking if os.open in os.supports_dir_fd else _open_directly
+def _comparable(path: str) -> str:
+    """`path` case-folded as the platform compares paths, without the extended-length prefix Windows may add."""
+    plain = '\\\\' + path[8:] if path.startswith('\\\\?\\UNC\\') else path.removeprefix('\\\\?\\')
+    return os.path.normcase(plain)
+
+
+def _final_path(descriptor: int) -> str:
+    """Where `descriptor` was opened, every link followed: from `/proc` on Linux, from the handle on Windows."""
+    if sys.platform == 'linux':
+        return os.readlink(f'/proc/self/fd/{descriptor}')
+    return _handle_final_path(descriptor)  # pragma: no cover
+
+
+def _handle_final_path(descriptor: int) -> str:  # pragma: no cover
+    """`GetFinalPathNameByHandleW` for `descriptor`; a platform with no such report refuses the read."""
+    if sys.platform != 'win32':
+        raise OSError(errno.ENOTSUP, 'This platform cannot report where an opened file lies')
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    get_final_path = ctypes.WinDLL('kernel32', use_last_error=True).GetFinalPathNameByHandleW
+    get_final_path.argtypes = (wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD)
+    get_final_path.restype = wintypes.DWORD
+    handle = msvcrt.get_osfhandle(descriptor)
+    size = get_final_path(handle, None, 0, 0)
+    buffer = ctypes.create_unicode_buffer(size)
+    written = get_final_path(handle, buffer, size, 0) if size else 0
+    if not written or written >= size:
+        raise ctypes.WinError(ctypes.get_last_error())
+    return buffer.value
 
 
 def _read_upload(root: Path, path: str, budget: int, max_upload_bytes: int) -> tuple[str, bytes]:
@@ -891,7 +933,7 @@ def _read_upload(root: Path, path: str, budget: int, max_upload_bytes: int) -> t
     resolved = _resolve(root, path)
     descriptor = -1
     try:
-        descriptor = _open_upload(resolved)
+        descriptor = _open_walking(resolved) if os.open in os.supports_dir_fd else _open_directly(resolved)
         info = os.fstat(descriptor)
         if not stat.S_ISREG(info.st_mode):
             raise _refused('unreadable_path', f'Path {_shown(path)} is not a regular file.')

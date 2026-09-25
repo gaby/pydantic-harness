@@ -110,7 +110,8 @@ class Xberg(AbstractCapability[AgentDepsT]):
     """Directory the tools may read files from, the working directory by default.
 
     Paths are resolved through symlinks before the check and opened without following them, so a
-    swap after the check is refused. On Windows the check holds at resolution time only.
+    swap after the check is refused. On Windows, which opens by path, the open file's final path is
+    checked instead.
     """
 
     max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES

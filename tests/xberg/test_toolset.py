@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import contextlib
 import math
+import os
 import socket
+import sys
 import threading
 from collections.abc import AsyncIterator, Callable, Generator
 from pathlib import Path
@@ -860,6 +862,41 @@ class TestFileAccess:
         toolset = XbergToolset[None](root=tmp_path)
         with pytest.raises(ModelRetry, match="'loop.pdf' is a symlink loop, or became a symlink after it was checked"):
             await toolset.extract(run_context, 'loop.pdf')
+
+    @pytest.mark.skipif(sys.platform != 'linux', reason='the fallback learns where a file was opened from /proc')
+    async def test_the_fallback_open_reads_a_file_inside_the_root(
+        self,
+        run_context: RunContext[None],
+        api_client: ClientFactory,
+        tmp_path: Path,
+        pdf: Path,
+        recorded: list[httpx.Request],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        toolset = XbergToolset[None](http_client=api_client(extraction(document())), root=tmp_path)
+        monkeypatch.setattr(os, 'supports_dir_fd', set[object]())
+
+        await toolset.extract(run_context, 'report.pdf')
+
+        assert uploaded_filenames(recorded[0]) == ['report.pdf']
+
+    @pytest.mark.skipif(sys.platform != 'linux', reason='the fallback learns where a file was opened from /proc')
+    async def test_the_fallback_open_refuses_a_file_a_swap_moved_outside_the_root(
+        self, run_context: RunContext[None], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        root, outside = tmp_path / 'root', tmp_path / 'outside'
+        root.mkdir()
+        outside.mkdir()
+        (outside / 'report.pdf').write_bytes(b'%PDF-1.7 secret')
+        (root / 'docs').symlink_to(outside, target_is_directory=True)
+        toolset = XbergToolset[None](root=root)
+        monkeypatch.setattr(os, 'supports_dir_fd', set[object]())
+        monkeypatch.setattr(os.path, 'realpath', os.path.abspath)
+
+        with pytest.raises(
+            ModelRetry, match="'docs/report.pdf' is a symlink loop, or became a symlink after it was checked"
+        ):
+            await toolset.extract(run_context, 'docs/report.pdf')
 
     async def test_follows_a_symlink_that_stays_inside_the_root(
         self, run_context: RunContext[None], api_client: ClientFactory, tmp_path: Path

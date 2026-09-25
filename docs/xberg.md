@@ -124,8 +124,9 @@ Files are opened one path component at a time from the filesystem root without f
 through the descriptor they are read from, so a directory or file swapped for a symlink after the root check is
 refused rather than followed. A symlink that resolves inside the root is read through its target, and uploaded
 under the name the model asked for rather than the target's, so the server reads the format from the extension it
-was given. On Windows, where the standard library cannot open relative to a directory handle, the check holds at
-resolution time only: a tree other processes rewrite concurrently is not a boundary there.
+was given. On Windows, where the standard library cannot open relative to a directory handle, the file is opened
+by path and refused unless the path Windows reports for the open handle is still the one checked, so a symlink or
+junction swapped in after the check is refused there too.
 `max_upload_bytes` (100 MiB by default) bounds what one request uploads: the file `extract` names, or every file of
 an `extract_batch` call together. It matches the server's own request body limit and is checked three times: on
 the size a file reports, before it is read, so a file that reports more than what is left of the limit is refused
